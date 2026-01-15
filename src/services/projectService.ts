@@ -31,6 +31,8 @@ export async function createProject(name: string): Promise<string> {
 // List user's projects
 export async function listProjects(): Promise<Project[]> {
   const { data: { user } } = await supabase.auth.getUser();
+  console.log('[projectService] listProjects - user:', user?.id, user?.email);
+
   if (!user) throw new Error('Not authenticated');
 
   const { data, error } = await supabase
@@ -38,6 +40,13 @@ export async function listProjects(): Promise<Project[]> {
     .select('*')
     .eq('owner_id', user.id)
     .order('updated_at', { ascending: false });
+
+  console.log('[projectService] listProjects - result:', {
+    count: data?.length,
+    error: error?.message,
+    errorCode: error?.code,
+    errorDetails: error?.details
+  });
 
   if (error) throw error;
   return data || [];
