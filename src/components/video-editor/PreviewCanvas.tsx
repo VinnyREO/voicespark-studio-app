@@ -104,6 +104,8 @@ export function PreviewCanvas({
   const animationFrameRef = useRef<number | null>(null);
   const imageCache = useRef<Map<string, HTMLImageElement>>(new Map());
   const playheadPositionRef = useRef(playheadPosition);
+  const lastPlayheadPositionRef = useRef(playheadPosition);
+  const currentVideoClipIdRef = useRef<string | null>(null);
 
   const getAspectRatioDimensions = (ratio: AspectRatioType) => {
     switch (ratio) {
@@ -116,10 +118,61 @@ export function PreviewCanvas({
     }
   };
 
-  // Sync playhead position to ref
+  // Sync playhead position to ref and detect significant jumps during playback
   useEffect(() => {
+    const previousPosition = lastPlayheadPositionRef.current;
+    const positionDelta = Math.abs(playheadPosition - previousPosition);
+
+    // Update refs
     playheadPositionRef.current = playheadPosition;
-  }, [playheadPosition]);
+    lastPlayheadPositionRef.current = playheadPosition;
+
+    // If playing and position jumped significantly (user clicked timeline), sync video immediately
+    // Normal playback advances ~0.016s per frame at 60fps, so jumps > 0.1s are likely user seeks
+    if (isPlaying && positionDelta > 0.1) {
+      const video = videoRef.current;
+      if (!video) return;
+
+      // Find all clips at playhead and sort by track priority (lower trackIndex = higher priority)
+      const activeClips = clips
+        .filter(clip =>
+          playheadPosition >= clip.startTime &&
+          playheadPosition < clip.startTime + clip.duration
+        )
+        .sort((a, b) => a.trackIndex - b.trackIndex);
+
+      const activeClip = activeClips[0];
+      const asset = activeClip ? assets.find(a => a.id === activeClip.assetId) : null;
+
+      if (asset?.type === 'video' && activeClip) {
+        const clipTrimStart = activeClip.trimStart ?? 0;
+        const clipTime = playheadPosition - activeClip.startTime + clipTrimStart;
+        video.currentTime = clipTime;
+        // Update the clip ID ref so transition check knows we're on this clip
+        currentVideoClipIdRef.current = activeClip.id;
+      }
+
+      // Also sync audio for audio-only clips (highest priority audio track)
+      const audioClips = clips
+        .filter(clip => {
+          const clipAsset = assets.find(a => a.id === clip.assetId);
+          return clipAsset?.type === 'audio' &&
+                 playheadPosition >= clip.startTime &&
+                 playheadPosition < clip.startTime + clip.duration;
+        })
+        .sort((a, b) => a.trackIndex - b.trackIndex);
+
+      const audioClip = audioClips[0];
+      if (audioClip) {
+        const audioAsset = assets.find(a => a.id === audioClip.assetId);
+        if (audioAsset) {
+          const clipTrimStart = audioClip.trimStart ?? 0;
+          const audioClipTime = playheadPosition - audioClip.startTime + clipTrimStart;
+          AudioManager.syncTime(audioClipTime);
+        }
+      }
+    }
+  }, [playheadPosition, isPlaying, clips, assets]);
 
   // Initialize video element once
   useEffect(() => {
@@ -144,13 +197,18 @@ export function PreviewCanvas({
     // Get current playhead position from ref instead of prop
     const currentPosition = playheadPositionRef.current;
 
-    // Find active clip at playhead that is on a visible track
-    const activeClip = clips.find(clip => {
+    // Find all clips at playhead that are on visible tracks
+    const activeClips = clips.filter(clip => {
       const trackSetting = trackSettings[clip.trackIndex] || { volume: 1, speed: 1, visible: true, muted: false };
       return trackSetting.visible &&
              currentPosition >= clip.startTime &&
              currentPosition < clip.startTime + clip.duration;
     });
+
+    // Sort by trackIndex - lower trackIndex = higher priority (Track 1 on top)
+    // Then select the highest priority clip (lowest trackIndex)
+    activeClips.sort((a, b) => a.trackIndex - b.trackIndex);
+    const activeClip = activeClips[0];
 
     // Only clear and show placeholder if there's NO visible clip
     if (!activeClip) {
@@ -281,11 +339,16 @@ export function PreviewCanvas({
     if (!video) return;
 
     const currentPosition = playheadPositionRef.current;
-    const activeClip = clips.find(clip =>
-      currentPosition >= clip.startTime &&
-      currentPosition < clip.startTime + clip.duration
-    );
 
+    // Find all clips at current position and sort by track priority (lower trackIndex = higher priority)
+    const activeClips = clips
+      .filter(clip =>
+        currentPosition >= clip.startTime &&
+        currentPosition < clip.startTime + clip.duration
+      )
+      .sort((a, b) => a.trackIndex - b.trackIndex);
+
+    const activeClip = activeClips[0];
     const asset = activeClip ? assets.find(a => a.id === activeClip.assetId) : null;
 
     // Handle video asset
@@ -374,11 +437,15 @@ export function PreviewCanvas({
     const video = videoRef.current;
     if (!video) return;
 
-    const activeClip = clips.find(clip =>
-      playheadPosition >= clip.startTime &&
-      playheadPosition < clip.startTime + clip.duration
-    );
+    // Find all clips at playhead and sort by track priority (lower trackIndex = higher priority)
+    const activeClips = clips
+      .filter(clip =>
+        playheadPosition >= clip.startTime &&
+        playheadPosition < clip.startTime + clip.duration
+      )
+      .sort((a, b) => a.trackIndex - b.trackIndex);
 
+    const activeClip = activeClips[0];
     const asset = activeClip ? assets.find(a => a.id === activeClip.assetId) : null;
 
     if (asset?.type === 'video') {
@@ -479,6 +546,114 @@ export function PreviewCanvas({
     return () => {
       clearInterval(syncInterval);
       AudioManager.stop();
+    };
+  }, [isPlaying]); // ONLY depend on isPlaying - refs handle everything else
+
+  // Video clip transition detection - ONLY syncs on clip changes, not continuously
+  // This prevents stutter by letting video play naturally once started
+  useEffect(() => {
+    if (!isPlaying) {
+      currentVideoClipIdRef.current = null;
+      return;
+    }
+
+    const video = videoRef.current;
+    if (!video) return;
+
+    // Check for clip transitions (not time sync - that causes stutter)
+    const checkClipTransition = () => {
+      const currentPosition = playheadPositionRef.current;
+      const currentClips = clipsRef.current;
+      const currentAssets = assetsRef.current;
+      const currentVolume = volumeRef.current;
+      const currentTrackSettings = trackSettingsRef.current;
+
+      // Find all video clips at playhead, sorted by track priority
+      const videoClips = currentClips
+        .filter(clip => {
+          const asset = currentAssets.find(a => a.id === clip.assetId);
+          const trackSetting = currentTrackSettings[clip.trackIndex] || { volume: 1, speed: 1, visible: true, muted: false };
+          return asset?.type === 'video' &&
+                 trackSetting.visible &&
+                 currentPosition >= clip.startTime &&
+                 currentPosition < clip.startTime + clip.duration;
+        })
+        .sort((a, b) => a.trackIndex - b.trackIndex);
+
+      const activeVideoClip = videoClips[0];
+
+      if (activeVideoClip) {
+        const asset = currentAssets.find(a => a.id === activeVideoClip.assetId);
+        if (!asset) return;
+
+        // ONLY sync when we transition to a DIFFERENT clip
+        const clipChanged = currentVideoClipIdRef.current !== activeVideoClip.id;
+
+        if (clipChanged) {
+          currentVideoClipIdRef.current = activeVideoClip.id;
+
+          // Update video source if different
+          if (currentAssetSrcRef.current !== asset.src) {
+            currentAssetSrcRef.current = asset.src;
+
+            // Revoke previous blob URL
+            if (currentBlobUrlRef.current) {
+              URL.revokeObjectURL(currentBlobUrlRef.current);
+              currentBlobUrlRef.current = null;
+            }
+
+            // Create new blob URL if file available
+            if (asset.file) {
+              const blobUrl = URL.createObjectURL(asset.file);
+              currentBlobUrlRef.current = blobUrl;
+              video.src = blobUrl;
+            } else {
+              video.src = asset.src;
+            }
+
+            video.load();
+          }
+
+          // Update volume and playback settings
+          const trackSetting = currentTrackSettings[activeVideoClip.trackIndex] || { volume: 1, speed: 1, visible: true, muted: false };
+          const clipVolume = activeVideoClip.volume ?? 1;
+          const finalVolume = currentVolume * trackSetting.volume * clipVolume;
+          video.muted = trackSetting.muted || finalVolume === 0;
+          video.volume = finalVolume;
+
+          const clipSpeed = activeVideoClip.speed ?? 1;
+          video.playbackRate = trackSetting.speed * clipSpeed;
+
+          // Set initial time position for the new clip
+          const clipTrimStart = activeVideoClip.trimStart ?? 0;
+          const clipTime = currentPosition - activeVideoClip.startTime + clipTrimStart;
+          video.currentTime = clipTime;
+
+          // Start playing
+          video.play().catch(() => {});
+        } else {
+          // Same clip - just ensure it's playing, don't touch currentTime
+          if (video.paused) {
+            video.play().catch(() => {});
+          }
+        }
+      } else {
+        // No video clip at playhead - pause video
+        if (currentVideoClipIdRef.current !== null) {
+          video.pause();
+          currentVideoClipIdRef.current = null;
+        }
+      }
+    };
+
+    // Run immediately
+    checkClipTransition();
+
+    // Check for clip transitions periodically (this is lightweight - no time sync)
+    const transitionCheckInterval = window.setInterval(checkClipTransition, 100);
+
+    return () => {
+      clearInterval(transitionCheckInterval);
     };
   }, [isPlaying]); // ONLY depend on isPlaying - refs handle everything else
 
