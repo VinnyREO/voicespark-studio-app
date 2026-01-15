@@ -98,6 +98,7 @@ export function PreviewCanvas({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRefs = useRef<Map<string, HTMLAudioElement>>(new Map());
+  const audioBlobUrlsRef = useRef<Map<string, string>>(new Map());
   const currentAssetSrcRef = useRef<string | null>(null);
   const currentBlobUrlRef = useRef<string | null>(null);
   const animationFrameRef = useRef<number | null>(null);
@@ -174,8 +175,8 @@ export function PreviewCanvas({
     if (asset.type === 'video' && videoRef.current) {
       const video = videoRef.current;
 
-      // Only draw if video has data ready
-      if (video.readyState >= HTMLVideoElement.HAVE_CURRENT_DATA) {
+      // Only draw if video has data ready (HAVE_CURRENT_DATA = 2)
+      if (video.readyState >= 2) {
         const videoAspect = video.videoWidth / video.videoHeight;
         const canvasAspect = canvas.width / canvas.height;
 
