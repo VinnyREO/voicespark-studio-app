@@ -1048,8 +1048,8 @@ export default function VideoForge() {
         }
       `}</style>
 
-      {/* Header space - Fixed height */}
-      <div className="h-[73px] flex-shrink-0" />
+      {/* Header space - matches fixed header h-16 (64px) */}
+      <div className="h-16 flex-shrink-0" />
 
       {/* Main content area - Grows to fill space */}
       <div className="flex-1 flex overflow-hidden">

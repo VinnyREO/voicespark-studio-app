@@ -91,8 +91,8 @@ export default function VoiceForge() {
 
   return (
     <div className="min-h-screen bg-background">
-      {/* Header space */}
-      <div className="h-[73px]" />
+      {/* Header space - matches fixed header h-16 (64px) */}
+      <div className="h-16" />
 
       <main className="container max-w-6xl mx-auto px-4 py-8">
         <div className="grid lg:grid-cols-[1fr,340px] gap-8">

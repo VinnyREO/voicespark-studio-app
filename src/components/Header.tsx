@@ -53,7 +53,7 @@ export function Header() {
   const userName = user?.user_metadata?.full_name || user?.email || 'User';
 
   return (
-    <header className="border-b bg-background">
+    <header className="fixed top-0 left-0 right-0 z-50 border-b bg-background">
       <div className="container mx-auto px-4 h-16 flex items-center justify-between">
         <Link to="/projects" className="flex items-center gap-3">
           <div className="w-10 h-10 bg-cyan-500 rounded-lg flex items-center justify-center">
