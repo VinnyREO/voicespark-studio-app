@@ -1,0 +1,197 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 240 10% 4%;
+    --foreground: 210 40% 98%;
+
+    --card: 240 10% 6%;
+    --card-foreground: 210 40% 98%;
+
+    --popover: 240 10% 8%;
+    --popover-foreground: 210 40% 98%;
+
+    --primary: 190 100% 50%;
+    --primary-foreground: 240 10% 4%;
+
+    --secondary: 240 10% 12%;
+    --secondary-foreground: 210 40% 98%;
+
+    --muted: 240 10% 15%;
+    --muted-foreground: 215 20% 55%;
+
+    --accent: 190 100% 50%;
+    --accent-foreground: 240 10% 4%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 240 10% 18%;
+    --input: 240 10% 15%;
+    --ring: 190 100% 50%;
+
+    --radius: 0.75rem;
+
+    /* Custom tokens */
+    --glow-primary: 0 0 30px hsl(190 100% 50% / 0.4);
+    --glow-primary-intense: 0 0 50px hsl(190 100% 50% / 0.6);
+    --glass-bg: hsl(240 10% 8% / 0.7);
+    --glass-border: hsl(240 10% 20% / 0.5);
+    
+    /* Style tag colors */
+    --tag-whisper: 270 70% 65%;
+    --tag-excited: 35 100% 60%;
+    --tag-serious: 0 70% 60%;
+    --tag-slow: 160 70% 50%;
+    --tag-fast: 45 100% 55%;
+    --tag-pause: 210 80% 60%;
+    --tag-emphasis: 320 80% 65%;
+
+    /* VideoForge accent */
+    --video: 280 80% 60%;
+    --video-foreground: 0 0% 100%;
+
+    --sidebar-background: 240 10% 6%;
+    --sidebar-foreground: 210 40% 98%;
+    --sidebar-primary: 190 100% 50%;
+    --sidebar-primary-foreground: 240 10% 4%;
+    --sidebar-accent: 240 10% 12%;
+    --sidebar-accent-foreground: 210 40% 98%;
+    --sidebar-border: 240 10% 18%;
+    --sidebar-ring: 190 100% 50%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: 'Plus Jakarta Sans', sans-serif;
+  }
+
+  .font-mono {
+    font-family: 'JetBrains Mono', monospace;
+  }
+}
+
+@layer components {
+  .glass-panel {
+    @apply bg-[hsl(var(--glass-bg))] backdrop-blur-xl border border-[hsl(var(--glass-border))] rounded-xl;
+  }
+
+  .glow-button {
+    @apply relative overflow-hidden transition-all duration-300;
+    box-shadow: var(--glow-primary);
+  }
+
+  .glow-button:hover {
+    box-shadow: var(--glow-primary-intense);
+  }
+
+  .glow-button::before {
+    content: '';
+    @apply absolute inset-0 opacity-0 transition-opacity duration-300;
+    background: linear-gradient(135deg, hsl(190 100% 60% / 0.2), transparent);
+  }
+
+  .glow-button:hover::before {
+    @apply opacity-100;
+  }
+
+  /* Style tag highlighting */
+  .style-tag {
+    @apply font-mono text-sm px-1 rounded;
+  }
+
+  .style-tag-whisper {
+    color: hsl(var(--tag-whisper));
+    background: hsl(var(--tag-whisper) / 0.15);
+  }
+
+  .style-tag-excited {
+    color: hsl(var(--tag-excited));
+    background: hsl(var(--tag-excited) / 0.15);
+  }
+
+  .style-tag-serious {
+    color: hsl(var(--tag-serious));
+    background: hsl(var(--tag-serious) / 0.15);
+  }
+
+  .style-tag-slow {
+    color: hsl(var(--tag-slow));
+    background: hsl(var(--tag-slow) / 0.15);
+  }
+
+  .style-tag-fast {
+    color: hsl(var(--tag-fast));
+    background: hsl(var(--tag-fast) / 0.15);
+  }
+
+  .style-tag-pause {
+    color: hsl(var(--tag-pause));
+    background: hsl(var(--tag-pause) / 0.15);
+  }
+
+  .style-tag-emphasis {
+    color: hsl(var(--tag-emphasis));
+    background: hsl(var(--tag-emphasis) / 0.15);
+  }
+
+  /* Waveform animation */
+  @keyframes waveform {
+    0%, 100% { transform: scaleY(0.5); }
+    50% { transform: scaleY(1); }
+  }
+
+  .waveform-bar {
+    @apply bg-primary/60 rounded-full;
+    animation: waveform 1s ease-in-out infinite;
+  }
+
+  /* Pulse glow */
+  @keyframes pulse-glow {
+    0%, 100% { box-shadow: 0 0 20px hsl(190 100% 50% / 0.3); }
+    50% { box-shadow: 0 0 40px hsl(190 100% 50% / 0.5); }
+  }
+
+  .animate-pulse-glow {
+    animation: pulse-glow 2s ease-in-out infinite;
+  }
+
+  /* Gradient text */
+  .gradient-text {
+    @apply bg-gradient-to-r from-primary via-cyan-300 to-primary bg-clip-text text-transparent;
+    background-size: 200% auto;
+  }
+
+  /* Scrollbar styling */
+  ::-webkit-scrollbar {
+    @apply w-2 h-2;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-background rounded-full;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-muted rounded-full;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-muted-foreground/50;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+}
