@@ -18,6 +18,7 @@ const INITIAL_STATE: EditorState = {
   volume: 1,
   duration: 0,
   trackSettings: {},
+  seekVersion: 0, // Increments on explicit user seeks to trigger media sync
 };
 
 interface UseVideoEditorResult {
@@ -44,6 +45,7 @@ interface UseVideoEditorResult {
 
   // Playback
   setPlayheadPosition: (position: number) => void;
+  seekTo: (position: number) => void; // Explicit seek that resets playback timing
   play: () => void;
   pause: () => void;
   togglePlayPause: () => void;
@@ -238,11 +240,35 @@ export function useVideoEditor(): UseVideoEditorResult {
     });
   }, [addToHistory, calculateDuration]);
 
+  // Track the playback start state to avoid restarting on every position change
+  const playbackStartRef = useRef<{ startTime: number; startPosition: number; version: number } | null>(null);
+  const seekVersionRef = useRef(0); // Track seek version to detect user intervention
+
   // Playback
   const setPlayheadPosition = useCallback((position: number) => {
     setState(prev => ({
       ...prev,
       playheadPosition: Math.max(0, Math.min(position, prev.duration)),
+    }));
+  }, []);
+
+  // Seek to a specific position (resets playback timing if playing)
+  // Use this when user explicitly seeks (clicking timeline, dragging playhead)
+  const seekTo = useCallback((position: number) => {
+    // Increment version to signal a new seek operation
+    seekVersionRef.current += 1;
+    const currentVersion = seekVersionRef.current;
+
+    // Reset playback reference to start from new position with current version
+    playbackStartRef.current = {
+      startTime: performance.now(),
+      startPosition: Math.max(0, position),
+      version: currentVersion,
+    };
+    setState(prev => ({
+      ...prev,
+      playheadPosition: Math.max(0, Math.min(position, prev.duration)),
+      seekVersion: (prev.seekVersion ?? 0) + 1, // Signal explicit seek to PreviewCanvas
     }));
   }, []);
 
@@ -266,19 +292,41 @@ export function useVideoEditor(): UseVideoEditorResult {
     setPlayheadPosition(state.duration);
   }, [setPlayheadPosition, state.duration]);
 
-  // Handle playback animation
+  // Handle playback animation - ONLY restart when isPlaying changes, not on every position update
   useEffect(() => {
     if (state.isPlaying) {
-      const startTime = performance.now();
-      const startPosition = state.playheadPosition;
+      // Only capture start state when playback begins, not on every render
+      if (!playbackStartRef.current) {
+        seekVersionRef.current += 1;
+        playbackStartRef.current = {
+          startTime: performance.now(),
+          startPosition: state.playheadPosition,
+          version: seekVersionRef.current,
+        };
+      }
 
       const animate = () => {
+        // Re-read from ref on EVERY frame to pick up seek changes
+        const ref = playbackStartRef.current;
+        if (!ref) return;
+
+        const { startTime, startPosition, version } = ref;
+
+        // Check if a seek happened since we started this animation frame
+        // If the version changed, another seekTo() was called - skip this frame
+        if (version !== seekVersionRef.current) {
+          // A new seek happened - reschedule and let the next frame use updated values
+          playbackInterval.current = requestAnimationFrame(animate);
+          return;
+        }
+
         const elapsed = (performance.now() - startTime) / 1000;
         const newPosition = startPosition + elapsed;
 
         if (newPosition >= state.duration) {
           pause();
           setPlayheadPosition(state.duration);
+          playbackStartRef.current = null;
         } else {
           setPlayheadPosition(newPosition);
           playbackInterval.current = requestAnimationFrame(animate);
@@ -292,14 +340,22 @@ export function useVideoEditor(): UseVideoEditorResult {
           cancelAnimationFrame(playbackInterval.current);
         }
       };
+    } else {
+      // Clear the ref when paused
+      playbackStartRef.current = null;
     }
-  }, [state.isPlaying, state.playheadPosition, state.duration, pause, setPlayheadPosition]);
+  }, [state.isPlaying, state.duration, pause, setPlayheadPosition]); // REMOVED state.playheadPosition dependency
 
   // Timeline
+  // Zoom levels: pixels per second
+  // At 0.1: ~2.8 hours visible in 1000px viewport
+  // At 1: ~16 minutes visible
+  // At 10: ~1.6 minutes visible
+  // At 50: ~20 seconds visible
   const setZoomLevel = useCallback((level: number) => {
     setState(prev => ({
       ...prev,
-      zoomLevel: Math.max(10, Math.min(level, 200)),
+      zoomLevel: Math.max(0.1, Math.min(level, 200)), // Allow extreme zoom out (0.1 = see hours)
     }));
   }, []);
 
@@ -417,9 +473,20 @@ export function useVideoEditor(): UseVideoEditorResult {
         return prev; // No clips to split
       }
 
-      let newClips = [...prev.clips];
+      // If there are selected clips, only split those that are both selected AND at playhead
+      // Otherwise, split all clips at playhead (legacy behavior)
+      const clipsToSplit = prev.selectedClipIds.length > 0
+        ? clipsAtPlayhead.filter(clip => prev.selectedClipIds.includes(clip.id))
+        : clipsAtPlayhead;
 
-      clipsAtPlayhead.forEach(clip => {
+      if (clipsToSplit.length === 0) {
+        return prev; // No selected clips at playhead to split
+      }
+
+      let newClips = [...prev.clips];
+      const newRightClipIds: string[] = []; // Track IDs of newly created right-side clips
+
+      clipsToSplit.forEach(clip => {
         const clipEndTime = clip.startTime + clip.duration;
 
         // Only split if playhead is actually within the clip (not at edges)
@@ -437,9 +504,11 @@ export function useVideoEditor(): UseVideoEditorResult {
 
           // Create right part
           const rightDuration = clip.duration - leftDuration;
+          const rightClipId = generateId();
+          newRightClipIds.push(rightClipId);
           newClips.push({
             ...clip,
-            id: generateId(),
+            id: rightClipId,
             startTime: playhead,
             duration: rightDuration,
             trimStart: clip.trimStart + leftDuration,
@@ -450,6 +519,8 @@ export function useVideoEditor(): UseVideoEditorResult {
       const newState = {
         ...prev,
         clips: newClips,
+        // Select the right-side clips after split for easy manipulation
+        selectedClipIds: newRightClipIds.length > 0 ? newRightClipIds : prev.selectedClipIds,
       };
       newState.duration = calculateDuration(newState.clips);
       addToHistory(newState);
@@ -573,6 +644,7 @@ export function useVideoEditor(): UseVideoEditorResult {
     deselectAll,
     deleteSelected,
     setPlayheadPosition,
+    seekTo,
     play,
     pause,
     togglePlayPause,

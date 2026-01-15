@@ -422,7 +422,7 @@ export default function VideoForge() {
   // NEW: File upload handler for MediaPanel - uploads to storage FIRST, then adds to editor
   const handleFileUpload = useCallback(async (file: File): Promise<void> => {
     console.log('[VideoForge] ========== handleFileUpload START ==========');
-    console.log('[VideoForge] File:', file.name, 'Size:', file.size);
+    console.log('[VideoForge] File:', file.name, 'Size:', file.size, 'bytes (', (file.size / 1024 / 1024).toFixed(2), 'MB)');
     console.log('[VideoForge] Project ID:', projectId);
 
     if (!projectId) {
@@ -551,7 +551,15 @@ export default function VideoForge() {
 
     } catch (error) {
       console.error('[VideoForge] ========== handleFileUpload FAILED ==========', error);
-      toast.error(`Failed to upload ${file.name}`);
+
+      // Provide more specific error messages
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      if (errorMessage.includes('storage') || errorMessage.includes('bucket')) {
+        toast.error(`Storage error: ${file.name} could not be uploaded. Please try again.`);
+      } else {
+        toast.error(`Failed to upload ${file.name}: ${errorMessage}`);
+      }
       throw error;
     }
   }, [projectId, editor, setUploadedMediaFiles]);
@@ -1116,6 +1124,7 @@ export default function VideoForge() {
               volume={editor.state.volume}
               trackSettings={editor.state.trackSettings}
               onDropFile={handleDropOnPreview}
+              seekVersion={editor.state.seekVersion}
             />
           </div>
 
@@ -1147,7 +1156,7 @@ export default function VideoForge() {
               onSelectClip={editor.selectClip}
               onUpdateClip={editor.updateClip}
               onUpdateMultipleClips={editor.updateMultipleClips}
-              onSetPlayhead={editor.setPlayheadPosition}
+              onSetPlayhead={editor.seekTo}
               onZoomChange={editor.setZoomLevel}
               onDropAsset={handleDropAsset}
               onDropExternalFile={handleDropExternalFile}

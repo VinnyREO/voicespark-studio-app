@@ -5,6 +5,8 @@ import { VoiceSelector } from '@/components/VoiceSelector';
 import { SettingsPanel } from '@/components/SettingsPanel';
 import { AudioPlayer } from '@/components/AudioPlayer';
 import { GenerateButton } from '@/components/GenerateButton';
+import { APIKeyInput } from '@/components/APIKeyInput';
+import { DeliveryStyleSelector, getStyleInstructions } from '@/components/DeliveryStyleSelector';
 import { useLocalStorage } from '@/hooks/useLocalStorage';
 import { useVoiceGeneration } from '@/hooks/useVoiceGeneration';
 import { VoiceId, GenerationSettings } from '@/types';
@@ -29,13 +31,17 @@ export default function VoiceForge() {
   const [searchParams] = useSearchParams();
   const projectId = searchParams.get('project');
 
-  const [apiKey] = useLocalStorage<string | null>('xai-api-key', null);
+  const [apiKey, setApiKey] = useLocalStorage<string | null>('xai-api-key', null);
   const [script, setScript] = useState(SAMPLE_SCRIPT);
   const [selectedVoice, setSelectedVoice] = useState<VoiceId>('Rex');
   const [settings, setSettings] = useState<GenerationSettings>({
     speed: 1.0,
     format: 'wav',
   });
+
+  // Delivery style state
+  const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null);
+  const [selectedTraits, setSelectedTraits] = useState<string[]>([]);
 
   const {
     isGenerating,
@@ -58,9 +64,11 @@ export default function VoiceForge() {
       return;
     }
 
+    const styleInstructions = getStyleInstructions(selectedPresetId, selectedTraits);
+
     reset();
-    await generate(script, selectedVoice, apiKey);
-  }, [apiKey, script, selectedVoice, generate, reset]);
+    await generate(script, selectedVoice, apiKey, styleInstructions);
+  }, [apiKey, script, selectedVoice, selectedPresetId, selectedTraits, generate, reset]);
 
   const handleDownload = useCallback(() => {
     if (!audioBlob || !audioUrl) return;
@@ -142,9 +150,41 @@ export default function VoiceForge() {
           <div className="space-y-6">
             <div className="lg:sticky lg:top-24">
               <div className="rounded-xl border border-border bg-card p-5 space-y-6">
+                {/* API Key Input */}
+                <div className="space-y-2">
+                  <p className="text-sm font-medium">API Key</p>
+                  <APIKeyInput
+                    apiKey={apiKey}
+                    onSave={(key) => {
+                      setApiKey(key);
+                      toast.success('API key saved');
+                    }}
+                    onClear={() => {
+                      setApiKey(null);
+                      toast.info('API key cleared');
+                    }}
+                  />
+                </div>
+
+                <div className="border-t border-border" />
+
                 <VoiceSelector
                   selectedVoice={selectedVoice}
                   onSelectVoice={setSelectedVoice}
+                />
+
+                <div className="border-t border-border" />
+
+                {/* Delivery Style */}
+                <DeliveryStyleSelector
+                  selectedPresetId={selectedPresetId}
+                  selectedTraits={selectedTraits}
+                  onPresetSelect={setSelectedPresetId}
+                  onTraitsChange={setSelectedTraits}
+                  onRecommendedVoice={(voiceId) => {
+                    setSelectedVoice(voiceId as VoiceId);
+                    toast.info(`Voice switched to ${voiceId}`);
+                  }}
                 />
 
                 <div className="border-t border-border" />

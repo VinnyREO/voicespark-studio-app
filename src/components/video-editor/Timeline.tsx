@@ -67,7 +67,13 @@ interface TimelineProps {
   onSaveNow?: () => void;
 }
 
-const MIN_ZOOM = 10;
+// Zoom levels: pixels per second
+// At MIN_ZOOM 0.1: 1000px viewport shows ~2.8 hours (10000 seconds)
+// At zoom 0.5: 1000px viewport shows ~33 minutes
+// At zoom 1: 1000px viewport shows ~16 minutes
+// At zoom 5: 1000px viewport shows ~3 minutes
+// At zoom 20: 1000px viewport shows ~50 seconds
+const MIN_ZOOM = 0.1; // Extreme zoom out - see hours of content
 const MAX_ZOOM = 200;
 
 function formatTime(seconds: number): string {
@@ -126,9 +132,18 @@ export function Timeline({
 }: TimelineProps) {
   const timelineRef = useRef<HTMLDivElement>(null);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
+  const horizontalScrollRef = useRef<HTMLDivElement>(null);
   const [isDraggingPlayhead, setIsDraggingPlayhead] = useState(false);
   const [minTrackCount, setMinTrackCount] = useState(3); // User can manually add more tracks
   const [showExportDialog, setShowExportDialog] = useState(false);
+
+  // Horizontal scroll state for the navigation slider
+  const [scrollPosition, setScrollPosition] = useState(0);
+  const [viewportWidth, setViewportWidth] = useState(800);
+
+  // Drag-to-scroll state
+  const [isDraggingToScroll, setIsDraggingToScroll] = useState(false);
+  const dragStartRef = useRef({ x: 0, scrollLeft: 0 });
 
   // Calculate number of tracks needed (minimum from user or 3, expand based on clips)
   const maxTrackIndex = clips.length > 0 ? Math.max(...clips.map(c => c.trackIndex)) : 0;
@@ -137,22 +152,45 @@ export function Timeline({
   // Timeline width - extend indefinitely based on content or scroll
   // Always extend well beyond current content to allow infinite scrolling
   const contentDuration = duration > 0 ? duration : 30;
-  const extendedDuration = Math.max(contentDuration * 2, 300); // At least 5 minutes or 2x content
-  const timelineWidth = Math.max(extendedDuration * zoomLevel, 3000); // Minimum 3000px
+  // At extreme zoom out, we need to show more time - extend to at least 2 hours or 2x content
+  const extendedDuration = Math.max(contentDuration * 2, 7200); // At least 2 hours or 2x content
+  const timelineWidth = Math.max(extendedDuration * zoomLevel, 2000); // Minimum 2000px
   const playheadLeftPx = Math.max(0, playheadPosition * zoomLevel); // Never position before 0
 
   // Generate time markers - extend indefinitely across entire timeline
   const markers = [];
-  const markerInterval = zoomLevel < 30 ? 10 : zoomLevel < 60 ? 5 : 1;
+  // Adaptive marker interval based on zoom level for readability
+  // Lower zoom = more zoomed out = need larger intervals
+  const markerInterval = zoomLevel < 0.15 ? 1800 : // Every 30 minutes at extreme zoom out
+                         zoomLevel < 0.3 ? 600 :  // Every 10 minutes
+                         zoomLevel < 0.5 ? 300 :  // Every 5 minutes
+                         zoomLevel < 1 ? 120 :    // Every 2 minutes
+                         zoomLevel < 2 ? 60 :     // Every minute
+                         zoomLevel < 5 ? 30 :     // Every 30 seconds
+                         zoomLevel < 15 ? 10 :    // Every 10 seconds
+                         zoomLevel < 30 ? 5 :     // Every 5 seconds
+                         zoomLevel < 60 ? 2 : 1;  // Every 2 or 1 second
   const maxTime = timelineWidth / zoomLevel;
   const markerCount = Math.ceil(maxTime / markerInterval);
 
   for (let i = 0; i <= markerCount; i++) {
     const time = i * markerInterval;
+    // Format label based on time magnitude
+    let label: string;
+    if (time >= 3600) {
+      // Hours: show as H:MM:SS
+      const hours = Math.floor(time / 3600);
+      const mins = Math.floor((time % 3600) / 60);
+      const secs = time % 60;
+      label = `${hours}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    } else {
+      // Minutes: show as M:SS
+      label = `${Math.floor(time / 60)}:${(time % 60).toString().padStart(2, '0')}`;
+    }
     markers.push({
       time,
       position: time * zoomLevel,
-      label: `${Math.floor(time / 60)}:${(time % 60).toString().padStart(2, '0')}`,
+      label,
     });
   }
 
@@ -196,45 +234,152 @@ export function Timeline({
     }
   }, [isDraggingPlayhead, handleMouseMove, handleMouseUp]);
 
-  // Cmd/Ctrl + Scroll to zoom, Shift + Scroll to pan horizontally
+  // Helper to scroll the timeline programmatically
+  const scrollTimelineTo = useCallback((newScrollLeft: number) => {
+    const scrollContainer = scrollAreaRef.current?.querySelector('[data-radix-scroll-area-viewport]') as HTMLElement | null;
+    if (scrollContainer) {
+      scrollContainer.scrollLeft = Math.max(0, Math.min(newScrollLeft, timelineWidth - viewportWidth));
+    }
+  }, [timelineWidth, viewportWidth]);
+
+  // Sync scroll position from timeline to state (for the scrollbar)
+  useEffect(() => {
+    const scrollContainer = scrollAreaRef.current?.querySelector('[data-radix-scroll-area-viewport]') as HTMLElement | null;
+    if (!scrollContainer) return;
+
+    const handleScroll = () => {
+      setScrollPosition(scrollContainer.scrollLeft);
+      setViewportWidth(scrollContainer.clientWidth);
+    };
+
+    // Initial setup
+    handleScroll();
+
+    scrollContainer.addEventListener('scroll', handleScroll);
+    window.addEventListener('resize', handleScroll);
+
+    return () => {
+      scrollContainer.removeEventListener('scroll', handleScroll);
+      window.removeEventListener('resize', handleScroll);
+    };
+  }, []);
+
+  // Cmd/Ctrl + Scroll to zoom (centered on mouse), Shift + Scroll to pan horizontally, regular scroll is vertical
   useEffect(() => {
     const handleWheel = (e: WheelEvent) => {
       if (e.metaKey || e.ctrlKey) {
-        // Zoom functionality
+        // Zoom functionality - zoom toward mouse position
         e.preventDefault();
-        const delta = e.deltaY > 0 ? -10 : 10;
-        const newZoom = Math.max(MIN_ZOOM, Math.min(zoomLevel + delta, MAX_ZOOM));
+        e.stopPropagation();
+
+        const scrollContainer = scrollAreaRef.current?.querySelector('[data-radix-scroll-area-viewport]') as HTMLElement | null;
+        if (!scrollContainer) return;
+
+        // Get mouse position relative to the timeline content (accounting for track label offset)
+        const rect = scrollContainer.getBoundingClientRect();
+        const mouseXInViewport = e.clientX - rect.left;
+        const mouseXInContent = scrollContainer.scrollLeft + mouseXInViewport - 80; // 80px track label offset
+
+        // Calculate the time position under the mouse
+        const timeUnderMouse = Math.max(0, mouseXInContent / zoomLevel);
+
+        // Calculate new zoom level
+        const zoomFactor = e.deltaY > 0 ? 0.85 : 1.18; // Zoom out = 0.85x, zoom in = 1.18x
+        const newZoom = Math.max(MIN_ZOOM, Math.min(zoomLevel * zoomFactor, MAX_ZOOM));
+
+        // Calculate where the same time position would be at the new zoom level
+        const newMouseXInContent = timeUnderMouse * newZoom;
+
+        // Calculate the new scroll position to keep the mouse over the same time
+        const newScrollLeft = newMouseXInContent - mouseXInViewport + 80;
+
+        // Apply zoom first, then scroll adjustment
         onZoomChange(newZoom);
+
+        // Use requestAnimationFrame to ensure zoom is applied before scrolling
+        requestAnimationFrame(() => {
+          scrollContainer.scrollLeft = Math.max(0, newScrollLeft);
+        });
       } else if (e.shiftKey) {
-        // Horizontal scroll functionality
+        // Shift + Scroll = horizontal pan
         e.preventDefault();
-        const scrollContainer = scrollAreaRef.current?.querySelector('[data-radix-scroll-area-viewport]');
-        if (scrollContainer) {
-          scrollContainer.scrollLeft += e.deltaY;
-        }
+        e.stopPropagation();
+        scrollTimelineTo(scrollPosition + e.deltaY * 2); // Multiply for faster scroll
+      } else if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+        // Trackpad horizontal swipe (no modifier needed)
+        e.preventDefault();
+        e.stopPropagation();
+        scrollTimelineTo(scrollPosition + e.deltaX);
       }
+      // Regular vertical scroll is handled by default browser behavior
     };
 
-    const timeline = timelineRef.current;
-    if (timeline) {
-      timeline.addEventListener('wheel', handleWheel, { passive: false });
+    // Attach to the scroll area viewport to capture events before ScrollArea handles them
+    const scrollContainer = scrollAreaRef.current?.querySelector('[data-radix-scroll-area-viewport]');
+    if (scrollContainer) {
+      scrollContainer.addEventListener('wheel', handleWheel, { passive: false });
       return () => {
-        timeline.removeEventListener('wheel', handleWheel);
+        scrollContainer.removeEventListener('wheel', handleWheel);
       };
     }
-  }, [zoomLevel, onZoomChange]);
+  }, [zoomLevel, onZoomChange, scrollPosition, scrollTimelineTo]);
+
+  // Drag-to-scroll: Middle mouse button or Space+drag to pan the timeline
+  const handleDragScrollStart = useCallback((e: React.MouseEvent) => {
+    // Middle mouse button (button 1) or if Space is held
+    if (e.button === 1) {
+      e.preventDefault();
+      const scrollContainer = scrollAreaRef.current?.querySelector('[data-radix-scroll-area-viewport]');
+      if (scrollContainer) {
+        setIsDraggingToScroll(true);
+        dragStartRef.current = {
+          x: e.clientX,
+          scrollLeft: scrollContainer.scrollLeft,
+        };
+      }
+    }
+  }, []);
+
+  const handleDragScrollMove = useCallback((e: MouseEvent) => {
+    if (!isDraggingToScroll) return;
+
+    const scrollContainer = scrollAreaRef.current?.querySelector('[data-radix-scroll-area-viewport]');
+    if (scrollContainer) {
+      const dx = e.clientX - dragStartRef.current.x;
+      scrollContainer.scrollLeft = dragStartRef.current.scrollLeft - dx;
+    }
+  }, [isDraggingToScroll]);
+
+  const handleDragScrollEnd = useCallback(() => {
+    setIsDraggingToScroll(false);
+  }, []);
+
+  useEffect(() => {
+    if (isDraggingToScroll) {
+      document.addEventListener('mousemove', handleDragScrollMove);
+      document.addEventListener('mouseup', handleDragScrollEnd);
+      return () => {
+        document.removeEventListener('mousemove', handleDragScrollMove);
+        document.removeEventListener('mouseup', handleDragScrollEnd);
+      };
+    }
+  }, [isDraggingToScroll, handleDragScrollMove, handleDragScrollEnd]);
 
   const handleZoomIn = () => {
-    onZoomChange(Math.min(zoomLevel + 10, MAX_ZOOM));
+    // Multiplicative zoom for consistent feel
+    onZoomChange(Math.min(zoomLevel * 1.3, MAX_ZOOM));
   };
 
   const handleZoomOut = () => {
-    onZoomChange(Math.max(zoomLevel - 10, MIN_ZOOM));
+    // Multiplicative zoom for consistent feel
+    onZoomChange(Math.max(zoomLevel * 0.7, MIN_ZOOM));
   };
 
   const handleFitToView = () => {
-    if (timelineRef.current && duration > 0) {
-      const availableWidth = timelineRef.current.clientWidth - 100;
+    if (scrollAreaRef.current && duration > 0) {
+      // Use scroll area width for accurate fit calculation
+      const scrollContainer = scrollAreaRef.current.querySelector('[data-radix-scroll-area-viewport]');
+      const availableWidth = (scrollContainer?.clientWidth || 800) - 100; // 100px for track labels
       const newZoom = availableWidth / duration;
       onZoomChange(Math.max(MIN_ZOOM, Math.min(newZoom, MAX_ZOOM)));
     }
@@ -633,9 +778,13 @@ export function Timeline({
             {/* Tracks */}
             <div
               ref={timelineRef}
-              className="relative"
+              className={cn(
+                "relative",
+                isDraggingToScroll && "cursor-grabbing"
+              )}
               style={{ width: `${timelineWidth}px` }}
               onClick={handleTimelineClick}
+              onMouseDown={handleDragScrollStart}
             >
               {/* Vertical time marker lines extending through all tracks */}
               <div className="absolute left-20 right-0 top-0 bottom-0 pointer-events-none">
@@ -706,6 +855,87 @@ export function Timeline({
             </div>
           </div>
         </ScrollArea>
+
+        {/* Horizontal Navigation Scrollbar */}
+        <div
+          ref={horizontalScrollRef}
+          className="h-6 bg-muted/30 border-t border-border flex items-center px-2 gap-2"
+          onWheel={(e) => {
+            // Any scroll on the scrollbar area scrolls horizontally
+            e.preventDefault();
+            scrollTimelineTo(scrollPosition + (e.deltaY || e.deltaX) * 2);
+          }}
+        >
+          {/* Track labels spacer */}
+          <div className="w-[72px] flex-shrink-0 text-xs text-muted-foreground text-center">
+            {Math.floor(scrollPosition / zoomLevel)}s
+          </div>
+
+          {/* Scrollbar track */}
+          <div
+            className="flex-1 h-3 bg-muted/50 rounded-full relative cursor-pointer"
+            onClick={(e) => {
+              const rect = e.currentTarget.getBoundingClientRect();
+              const clickX = e.clientX - rect.left;
+              const percentage = clickX / rect.width;
+              const newScrollPosition = percentage * (timelineWidth - viewportWidth);
+              scrollTimelineTo(newScrollPosition);
+            }}
+          >
+            {/* Visible content indicator (where clips are) */}
+            {duration > 0 && (
+              <div
+                className="absolute top-1/2 -translate-y-1/2 h-1 bg-primary/30 rounded-full"
+                style={{
+                  left: '0%',
+                  width: `${Math.min(100, (duration * zoomLevel / timelineWidth) * 100)}%`
+                }}
+              />
+            )}
+
+            {/* Scrollbar thumb */}
+            <div
+              className="absolute top-0 h-full bg-primary/60 hover:bg-primary/80 rounded-full cursor-grab active:cursor-grabbing transition-colors"
+              style={{
+                left: `${(scrollPosition / timelineWidth) * 100}%`,
+                width: `${Math.max(5, (viewportWidth / timelineWidth) * 100)}%`
+              }}
+              onMouseDown={(e) => {
+                e.preventDefault();
+                const startX = e.clientX;
+                const startScroll = scrollPosition;
+                const trackWidth = e.currentTarget.parentElement?.clientWidth || 1;
+
+                const handleMove = (moveEvent: MouseEvent) => {
+                  const deltaX = moveEvent.clientX - startX;
+                  const scrollDelta = (deltaX / trackWidth) * timelineWidth;
+                  scrollTimelineTo(startScroll + scrollDelta);
+                };
+
+                const handleUp = () => {
+                  document.removeEventListener('mousemove', handleMove);
+                  document.removeEventListener('mouseup', handleUp);
+                };
+
+                document.addEventListener('mousemove', handleMove);
+                document.addEventListener('mouseup', handleUp);
+              }}
+            />
+
+            {/* Playhead position marker on scrollbar */}
+            <div
+              className="absolute top-0 bottom-0 w-0.5 bg-red-500 pointer-events-none"
+              style={{
+                left: `${(playheadPosition * zoomLevel / timelineWidth) * 100}%`
+              }}
+            />
+          </div>
+
+          {/* Duration display */}
+          <div className="w-16 flex-shrink-0 text-xs text-muted-foreground text-right">
+            {formatTime(duration)}
+          </div>
+        </div>
       </div>
     </div>
   );

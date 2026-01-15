@@ -3,6 +3,7 @@ import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
 }
 
 serve(async (req) => {
@@ -24,6 +25,14 @@ serve(async (req) => {
       )
     }
 
+    // Validate API key format
+    if (!apiKey.startsWith('xai-')) {
+      return new Response(
+        JSON.stringify({ error: 'Invalid API key format. xAI keys should start with "xai-"' }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      )
+    }
+
     // Process script - convert style tags to natural language hints
     const processedScript = script
       .replace(/\[whisper\](.*?)\[\/whisper\]/gi, '(softly) $1')
@@ -37,15 +46,15 @@ serve(async (req) => {
       .replace(/\[angry\](.*?)\[\/angry\]/gi, '(angrily) $1')
       .replace(/\[pause:?\d*s?\]/gi, '...')
 
-    console.log('Generating voice with:', { voice: voice || 'Rex', scriptLength: processedScript.length })
+    console.log('Generating voice with:', { voice: voice || 'tara', scriptLength: processedScript.length })
 
     // Connect to xAI WebSocket and generate audio
-    const audioData = await generateVoiceoverViaWebSocket(apiKey, processedScript, voice || 'Rex', finalStyleInstructions)
+    const audioData = await generateVoiceoverViaWebSocket(apiKey, processedScript, voice || 'tara', finalStyleInstructions)
 
     // Return audio as base64
     return new Response(
-      JSON.stringify({ 
-        success: true, 
+      JSON.stringify({
+        success: true,
         audio: audioData.audio,
         transcript: audioData.transcript,
         format: 'wav'
@@ -55,21 +64,23 @@ serve(async (req) => {
 
   } catch (error) {
     console.error('Voice generation error:', error)
-    
+
     const errorMessage = error instanceof Error ? error.message : 'Voice generation failed'
     let userMessage = errorMessage
-    
+
     // Provide helpful error messages
     if (errorMessage.includes('not authorized') || errorMessage.includes('permission') || errorMessage.includes('403')) {
       userMessage = 'Voice API not enabled. Create a new API key at console.x.ai with "realtime" endpoint enabled.'
     } else if (errorMessage.includes('401') || errorMessage.includes('Unauthorized') || errorMessage.includes('invalid')) {
-      userMessage = 'Invalid API key. Check your xAI API key.'
+      userMessage = 'Invalid API key. Check your xAI API key at console.x.ai'
     } else if (errorMessage.includes('402') || errorMessage.includes('billing') || errorMessage.includes('payment')) {
       userMessage = 'Billing issue. Add credits at console.x.ai'
     } else if (errorMessage.includes('429') || errorMessage.includes('rate')) {
       userMessage = 'Rate limited. Please wait a moment and try again.'
+    } else if (errorMessage.includes('1006') || errorMessage.includes('abnormal')) {
+      userMessage = 'Connection failed. Verify your API key has realtime/voice permissions at console.x.ai'
     }
-    
+
     return new Response(
       JSON.stringify({ error: userMessage, details: errorMessage }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -77,20 +88,62 @@ serve(async (req) => {
   }
 })
 
+// First, get an ephemeral token from xAI (recommended for WebSocket connections)
+async function getEphemeralToken(apiKey: string): Promise<string> {
+  const response = await fetch('https://api.x.ai/v1/realtime/client_secrets', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      expires_after: { seconds: 300 } // 5 minute token
+    }),
+  })
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => '')
+    console.error('Failed to get ephemeral token:', response.status, errorText)
+
+    if (response.status === 401) {
+      throw new Error('401 Unauthorized - Invalid API key')
+    } else if (response.status === 403) {
+      throw new Error('403 Forbidden - Voice/Realtime API not enabled. Create a new API key at console.x.ai with realtime permissions.')
+    } else if (response.status === 402) {
+      throw new Error('402 Payment Required - Add credits at console.x.ai')
+    }
+    throw new Error(`Failed to get ephemeral token: ${response.status} ${errorText}`)
+  }
+
+  const data = await response.json()
+  // The response contains client_secret.value
+  return data.client_secret?.value || data.secret || data.token
+}
+
 async function generateVoiceoverViaWebSocket(
-  apiKey: string, 
-  script: string, 
+  apiKey: string,
+  script: string,
   voice: string,
   styleInstructions: string
 ): Promise<{ audio: string; transcript: string }> {
+  // Get ephemeral token first (this validates the API key has realtime permissions)
+  console.log('Getting ephemeral token from xAI...')
+  const ephemeralToken = await getEphemeralToken(apiKey)
+
+  if (!ephemeralToken) {
+    throw new Error('Failed to obtain ephemeral token from xAI')
+  }
+  console.log('Got ephemeral token, connecting to WebSocket...')
+
   return new Promise((resolve, reject) => {
     const audioChunks: string[] = []
     let transcript = ''
-    
-    // Use Deno's WebSocket with authentication subprotocols
+
+    // Connect using OpenAI-compatible subprotocol with ephemeral token
+    // xAI is compatible with OpenAI Realtime API
     const ws = new WebSocket('wss://api.x.ai/v1/realtime', [
       'realtime',
-      `openai-insecure-api-key.${apiKey}`,
+      `openai-insecure-api-key.${ephemeralToken}`,
       'openai-beta.realtime-v1'
     ])
 
@@ -101,7 +154,7 @@ async function generateVoiceoverViaWebSocket(
 
     ws.onopen = () => {
       console.log('WebSocket connected to xAI')
-      
+
       // Configure session with delivery style
       ws.send(JSON.stringify({
         type: 'session.update',
@@ -145,8 +198,8 @@ ${script}`,
 
     ws.onmessage = (event) => {
       try {
-        const data = JSON.parse(event.data)
-        
+        const data = JSON.parse(event.data as string)
+
         // Collect audio chunks
         if (data.type === 'response.audio.delta' || data.type === 'response.output_audio.delta') {
           if (data.delta) {
@@ -164,7 +217,7 @@ ${script}`,
         // Handle completion
         if (data.type === 'response.done' || data.type === 'response.audio.done') {
           clearTimeout(timeout)
-          
+
           if (audioChunks.length === 0) {
             ws.close()
             reject(new Error('No audio generated. Try a different script or voice.'))
@@ -176,12 +229,12 @@ ${script}`,
           // Combine audio chunks and create WAV
           const combinedAudio = audioChunks.join('')
           const wavBase64 = createWavFromPcm(combinedAudio)
-          
+
           ws.close()
           resolve({ audio: wavBase64, transcript })
         }
 
-        // Handle errors
+        // Handle errors from xAI
         if (data.type === 'error') {
           clearTimeout(timeout)
           ws.close()
@@ -193,9 +246,8 @@ ${script}`,
       }
     }
 
-    ws.onerror = (error) => {
+    ws.onerror = () => {
       clearTimeout(timeout)
-      console.error('WebSocket error:', error)
       reject(new Error('WebSocket connection failed. Check API key permissions.'))
     }
 

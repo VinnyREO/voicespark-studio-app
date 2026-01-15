@@ -3,43 +3,76 @@ import { AspectRatio as AspectRatioType, MediaAsset, TimelineClip } from '@/type
 import { cn } from '@/lib/utils';
 
 // Singleton Audio Manager - guarantees only ONE audio plays at a time globally
+// Key insight: Only start/stop on clip transitions, never sync time during playback
 const AudioManager = {
   _audio: null as HTMLAudioElement | null,
   _currentClipId: null as string | null,
   _blobUrls: new Map<string, string>(),
+  _isTransitioning: false, // Prevent race conditions during async operations
 
-  play(clipId: string, src: string, file: File | undefined, startTime: number, volume: number, playbackRate: number) {
-    // If same clip is already playing, just update properties
-    if (this._currentClipId === clipId && this._audio && !this._audio.paused) {
-      this._audio.volume = Math.min(1, Math.max(0, volume));
-      this._audio.playbackRate = playbackRate;
-      // Sync time if significantly off
-      if (Math.abs(this._audio.currentTime - startTime) > 0.2) {
-        this._audio.currentTime = startTime;
-      }
+  // Start playing a NEW clip - only call this on clip transitions
+  startClip(clipId: string, src: string, file: File | undefined, startTime: number, volume: number, playbackRate: number) {
+    // Prevent re-entry during async operations
+    if (this._isTransitioning) return;
+
+    // If same clip, don't restart - just update settings
+    if (this._currentClipId === clipId) {
+      this.updateSettings(volume, playbackRate);
       return;
     }
 
-    // Different clip or not playing - stop current and start new
-    this.stop();
+    this._isTransitioning = true;
 
-    // Create new audio element
-    this._audio = new Audio();
-    this._audio.preload = 'auto';
-    this._currentClipId = clipId;
-
-    // Get or create blob URL
-    let blobUrl = this._blobUrls.get(clipId);
-    if (!blobUrl && file) {
-      blobUrl = URL.createObjectURL(file);
-      this._blobUrls.set(clipId, blobUrl);
+    // Stop current audio completely
+    if (this._audio) {
+      this._audio.pause();
+      this._audio.src = '';
+      this._audio = null;
     }
 
-    this._audio.src = blobUrl || src;
-    this._audio.volume = Math.min(1, Math.max(0, volume));
-    this._audio.playbackRate = playbackRate;
-    this._audio.currentTime = startTime;
-    this._audio.play().catch(() => {});
+    this._currentClipId = clipId;
+
+    // Create new audio element
+    const audio = new Audio();
+    audio.preload = 'auto';
+
+    // Get or create blob URL (keyed by clipId to ensure uniqueness)
+    let audioSrc: string;
+    if (file) {
+      let blobUrl = this._blobUrls.get(clipId);
+      if (!blobUrl) {
+        blobUrl = URL.createObjectURL(file);
+        this._blobUrls.set(clipId, blobUrl);
+      }
+      audioSrc = blobUrl;
+    } else {
+      audioSrc = src;
+    }
+
+    audio.src = audioSrc;
+    audio.volume = Math.min(1, Math.max(0, volume));
+    audio.playbackRate = playbackRate;
+    audio.currentTime = startTime;
+
+    // Store reference before play
+    this._audio = audio;
+
+    // Play and handle completion
+    audio.play()
+      .then(() => {
+        this._isTransitioning = false;
+      })
+      .catch(() => {
+        this._isTransitioning = false;
+      });
+  },
+
+  // Update volume/speed without touching time or restarting
+  updateSettings(volume: number, playbackRate: number) {
+    if (this._audio) {
+      this._audio.volume = Math.min(1, Math.max(0, volume));
+      this._audio.playbackRate = playbackRate;
+    }
   },
 
   stop() {
@@ -49,22 +82,18 @@ const AudioManager = {
       this._audio = null;
     }
     this._currentClipId = null;
+    this._isTransitioning = false;
   },
 
-  updateVolume(volume: number) {
-    if (this._audio) {
-      this._audio.volume = Math.min(1, Math.max(0, volume));
-    }
-  },
-
+  // Only call this for explicit user seeks (clicking timeline, dragging playhead)
   syncTime(time: number) {
-    if (this._audio && Math.abs(this._audio.currentTime - time) > 0.2) {
+    if (this._audio && !this._isTransitioning) {
       this._audio.currentTime = time;
     }
   },
 
-  isPlayingClip(clipId: string): boolean {
-    return this._currentClipId === clipId && this._audio !== null && !this._audio.paused;
+  getCurrentClipId(): string | null {
+    return this._currentClipId;
   },
 
   cleanup() {
@@ -83,6 +112,7 @@ interface PreviewCanvasProps {
   volume: number;
   trackSettings?: Record<number, { volume: number; speed: number; visible: boolean; muted: boolean }>;
   onDropFile?: (file: File) => void;
+  seekVersion?: number; // Increments when user explicitly seeks - triggers media sync
 }
 
 export function PreviewCanvas({
@@ -94,6 +124,7 @@ export function PreviewCanvas({
   volume,
   trackSettings = {},
   onDropFile,
+  seekVersion = 0,
 }: PreviewCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -104,8 +135,9 @@ export function PreviewCanvas({
   const animationFrameRef = useRef<number | null>(null);
   const imageCache = useRef<Map<string, HTMLImageElement>>(new Map());
   const playheadPositionRef = useRef(playheadPosition);
-  const lastPlayheadPositionRef = useRef(playheadPosition);
+  const lastSeekVersionRef = useRef(seekVersion);
   const currentVideoClipIdRef = useRef<string | null>(null);
+  const currentAudioClipIdRef = useRef<string | null>(null);
 
   const getAspectRatioDimensions = (ratio: AspectRatioType) => {
     switch (ratio) {
@@ -118,72 +150,19 @@ export function PreviewCanvas({
     }
   };
 
-  // Sync playhead position to ref and detect significant jumps during playback
+  // Sync playhead position to ref
   useEffect(() => {
-    const previousPosition = lastPlayheadPositionRef.current;
-    const positionDelta = Math.abs(playheadPosition - previousPosition);
-
-    // Update refs
     playheadPositionRef.current = playheadPosition;
-    lastPlayheadPositionRef.current = playheadPosition;
+  }, [playheadPosition]);
 
-    // If playing and position jumped significantly (user clicked timeline), sync video immediately
-    // Normal playback advances ~0.016s per frame at 60fps, so jumps > 0.1s are likely user seeks
-    if (isPlaying && positionDelta > 0.1) {
-      const video = videoRef.current;
-      if (!video) return;
-
-      // Find all clips at playhead and sort by track priority (lower trackIndex = higher priority)
-      const activeClips = clips
-        .filter(clip =>
-          playheadPosition >= clip.startTime &&
-          playheadPosition < clip.startTime + clip.duration
-        )
-        .sort((a, b) => a.trackIndex - b.trackIndex);
-
-      const activeClip = activeClips[0];
-      const asset = activeClip ? assets.find(a => a.id === activeClip.assetId) : null;
-
-      if (asset?.type === 'video' && activeClip) {
-        const clipTrimStart = activeClip.trimStart ?? 0;
-        const clipTime = playheadPosition - activeClip.startTime + clipTrimStart;
-        video.currentTime = clipTime;
-        // Update the clip ID ref so transition check knows we're on this clip
-        currentVideoClipIdRef.current = activeClip.id;
-      }
-
-      // Also sync audio for audio-only clips (highest priority audio track)
-      const audioClips = clips
-        .filter(clip => {
-          const clipAsset = assets.find(a => a.id === clip.assetId);
-          return clipAsset?.type === 'audio' &&
-                 playheadPosition >= clip.startTime &&
-                 playheadPosition < clip.startTime + clip.duration;
-        })
-        .sort((a, b) => a.trackIndex - b.trackIndex);
-
-      const audioClip = audioClips[0];
-      if (audioClip) {
-        const audioAsset = assets.find(a => a.id === audioClip.assetId);
-        if (audioAsset) {
-          const clipTrimStart = audioClip.trimStart ?? 0;
-          const audioClipTime = playheadPosition - audioClip.startTime + clipTrimStart;
-          AudioManager.syncTime(audioClipTime);
-        }
-      }
-    }
-  }, [playheadPosition, isPlaying, clips, assets]);
-
-  // Initialize video element once
-  useEffect(() => {
-    if (!videoRef.current) {
-      const video = document.createElement('video');
-      video.preload = 'auto';
-      video.playsInline = true;
-      video.muted = true; // Start muted to avoid autoplay issues
-      videoRef.current = video;
-    }
-  }, []);
+  // Initialize video element once - run synchronously before other effects
+  if (!videoRef.current) {
+    const video = document.createElement('video');
+    video.preload = 'auto';
+    video.playsInline = true;
+    video.muted = true; // Start muted to avoid autoplay issues
+    videoRef.current = video;
+  }
 
   // Draw frame to canvas - optimized for smooth playback
   // STABLE: Only depends on clips/assets, not playheadPosition
@@ -234,7 +213,7 @@ export function PreviewCanvas({
       const video = videoRef.current;
 
       // Only draw if video has data ready (HAVE_CURRENT_DATA = 2)
-      if (video.readyState >= 2) {
+      if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
         const videoAspect = video.videoWidth / video.videoHeight;
         const canvasAspect = canvas.width / canvas.height;
 
@@ -256,6 +235,15 @@ export function PreviewCanvas({
         }
 
         ctx.drawImage(video, drawX, drawY, drawWidth, drawHeight);
+      } else {
+        // Video not ready yet - show loading indicator
+        ctx.fillStyle = '#333';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#888';
+        ctx.font = '16px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('Loading video...', canvas.width / 2, canvas.height / 2);
       }
     }
 
@@ -331,6 +319,122 @@ export function PreviewCanvas({
       ctx.fillText(asset.name, canvas.width / 2, canvas.height / 2 + 40);
     }
   }, [clips, assets, trackSettings]); // STABLE: removed playheadPosition dependency
+
+  // Handle explicit user seeks - sync video and audio to new position
+  // This fires when seekVersion changes (user clicked timeline, dragged playhead, etc.)
+  useEffect(() => {
+    // Skip initial render
+    if (lastSeekVersionRef.current === seekVersion) return;
+    lastSeekVersionRef.current = seekVersion;
+
+    const video = videoRef.current;
+    if (!video) return;
+
+    // Find all clips at playhead and sort by track priority (lower trackIndex = higher priority)
+    const activeClips = clips
+      .filter(clip =>
+        playheadPosition >= clip.startTime &&
+        playheadPosition < clip.startTime + clip.duration
+      )
+      .sort((a, b) => a.trackIndex - b.trackIndex);
+
+    const activeClip = activeClips[0];
+    const asset = activeClip ? assets.find(a => a.id === activeClip.assetId) : null;
+
+    // Sync video to new position (always sync video frame for preview)
+    if (asset?.type === 'video' && activeClip) {
+      const clipTrimStart = activeClip.trimStart ?? 0;
+      const clipTime = playheadPosition - activeClip.startTime + clipTrimStart;
+
+      // Check if we need to load a different video source
+      if (currentAssetSrcRef.current !== asset.src) {
+        currentAssetSrcRef.current = asset.src;
+
+        // Revoke previous blob URL if it exists
+        if (currentBlobUrlRef.current) {
+          URL.revokeObjectURL(currentBlobUrlRef.current);
+          currentBlobUrlRef.current = null;
+        }
+
+        // Create blob URL from file or use src
+        if (asset.file) {
+          const blobUrl = URL.createObjectURL(asset.file);
+          currentBlobUrlRef.current = blobUrl;
+          video.src = blobUrl;
+        } else {
+          video.src = asset.src;
+        }
+
+        // Wait for video to load enough data, then seek and draw
+        const onCanPlay = () => {
+          video.currentTime = clipTime;
+          video.removeEventListener('canplay', onCanPlay);
+        };
+        const onSeeked = () => {
+          drawFrame();
+          video.removeEventListener('seeked', onSeeked);
+        };
+        video.addEventListener('canplay', onCanPlay);
+        video.addEventListener('seeked', onSeeked);
+        video.load();
+      } else {
+        // Same video source - just seek and draw
+        video.currentTime = clipTime;
+        const onSeeked = () => {
+          drawFrame();
+          video.removeEventListener('seeked', onSeeked);
+        };
+        video.addEventListener('seeked', onSeeked);
+      }
+
+      // Update the clip ID ref so transition check knows we're on this clip
+      currentVideoClipIdRef.current = activeClip.id;
+    } else {
+      // No video clip at this position - draw placeholder or image
+      drawFrame();
+    }
+
+    // Only sync audio if currently playing - don't start audio when paused
+    if (isPlaying) {
+      const audioClips = clips
+        .filter(clip => {
+          const clipAsset = assets.find(a => a.id === clip.assetId);
+          return clipAsset?.type === 'audio' &&
+                 playheadPosition >= clip.startTime &&
+                 playheadPosition < clip.startTime + clip.duration;
+        })
+        .sort((a, b) => a.trackIndex - b.trackIndex);
+
+      const audioClip = audioClips[0];
+      if (audioClip) {
+        const audioAsset = assets.find(a => a.id === audioClip.assetId);
+        if (audioAsset) {
+          const trackSetting = trackSettings[audioClip.trackIndex] || { volume: 1, speed: 1, visible: true, muted: false };
+          const clipVolume = audioClip.volume ?? 1;
+          const finalVolume = volume * trackSetting.volume * clipVolume;
+          const clipSpeed = audioClip.speed ?? 1;
+          const clipTrimStart = audioClip.trimStart ?? 0;
+          const audioClipTime = playheadPosition - audioClip.startTime + clipTrimStart;
+
+          // Stop current audio and restart from new position
+          AudioManager.stop();
+          currentAudioClipIdRef.current = audioClip.id;
+          AudioManager.startClip(
+            audioClip.id,
+            audioAsset.src,
+            audioAsset.file,
+            audioClipTime,
+            finalVolume,
+            trackSetting.speed * clipSpeed
+          );
+        }
+      } else {
+        // No audio clip at new position - stop any playing audio
+        AudioManager.stop();
+        currentAudioClipIdRef.current = null;
+      }
+    }
+  }, [seekVersion, playheadPosition, isPlaying, clips, assets, volume, trackSettings, drawFrame]);
 
   // Handle video source changes and playback state
   // SIMPLIFIED: Only runs on clip/asset/playing/volume changes, not playheadPosition
@@ -431,6 +535,7 @@ export function PreviewCanvas({
   }, [clips, assets, isPlaying, volume, drawFrame]); // REMOVED playheadPosition
 
   // Handle user scrubbing when paused - immediate frame-accurate preview
+  // This is the PRIMARY effect for showing video frames when paused
   useEffect(() => {
     if (isPlaying) return; // Only handle when paused
 
@@ -449,27 +554,99 @@ export function PreviewCanvas({
     const asset = activeClip ? assets.find(a => a.id === activeClip.assetId) : null;
 
     if (asset?.type === 'video') {
-      const clipTime = playheadPosition - activeClip!.startTime + activeClip!.trimStart;
+      const clipTrimStart = activeClip!.trimStart ?? 0;
+      const clipTime = playheadPosition - activeClip!.startTime + clipTrimStart;
 
-      // Seek immediately for accurate scrubbing (reduced threshold for better responsiveness)
-      if (Math.abs(video.currentTime - clipTime) > 0.016) { // ~1 frame at 60fps
+      // Helper to seek and draw frame once video is ready
+      const seekAndDraw = () => {
         video.currentTime = clipTime;
-
-        // Wait for seek to complete before drawing
         const onSeeked = () => {
           drawFrame();
           video.removeEventListener('seeked', onSeeked);
         };
         video.addEventListener('seeked', onSeeked);
+
+        // Fallback: if seeked event doesn't fire within 500ms, draw anyway
+        setTimeout(() => {
+          if (video.readyState >= 2) {
+            drawFrame();
+          }
+        }, 500);
+      };
+
+      // Check if we need to load a different video source
+      if (currentAssetSrcRef.current !== asset.src) {
+        currentAssetSrcRef.current = asset.src;
+
+        // Revoke previous blob URL if it exists
+        if (currentBlobUrlRef.current) {
+          URL.revokeObjectURL(currentBlobUrlRef.current);
+          currentBlobUrlRef.current = null;
+        }
+
+        // Create blob URL from file or use src
+        if (asset.file) {
+          const blobUrl = URL.createObjectURL(asset.file);
+          currentBlobUrlRef.current = blobUrl;
+          video.src = blobUrl;
+        } else {
+          video.src = asset.src;
+        }
+
+        // Wait for video to have enough data to seek
+        const onLoadedMetadata = () => {
+          seekAndDraw();
+          video.removeEventListener('loadedmetadata', onLoadedMetadata);
+        };
+        video.addEventListener('loadedmetadata', onLoadedMetadata);
+        video.load();
+
+        // Fallback: if loadedmetadata doesn't fire within 1 second, try to draw anyway
+        setTimeout(() => {
+          if (video.readyState >= 2) {
+            drawFrame();
+          }
+        }, 1000);
+      } else if (video.readyState >= 1) {
+        // Same video source AND video has metadata - seek immediately
+        if (Math.abs(video.currentTime - clipTime) > 0.016) { // ~1 frame at 60fps
+          seekAndDraw();
+        } else {
+          // Already at correct time, just redraw
+          drawFrame();
+        }
       } else {
-        // If already at correct time, just redraw
-        drawFrame();
+        // Video source is set but not loaded yet - wait for metadata
+        const onLoadedMetadata = () => {
+          seekAndDraw();
+          video.removeEventListener('loadedmetadata', onLoadedMetadata);
+        };
+        video.addEventListener('loadedmetadata', onLoadedMetadata);
+        // Try loading if not already
+        if (video.src) {
+          video.load();
+        }
+
+        // Fallback timeout
+        setTimeout(() => {
+          if (video.readyState >= 2) {
+            drawFrame();
+          }
+        }, 1000);
       }
     } else {
       // For images or no clip, always redraw immediately
       drawFrame();
     }
   }, [playheadPosition, isPlaying, clips, assets, drawFrame]);
+
+  // Draw initial frame on mount and when clips/assets first load
+  // This ensures something is visible immediately without user interaction
+  useEffect(() => {
+    // Always draw on mount/clip changes - this handles the initial "No video at playhead" message
+    // and ensures images load correctly
+    drawFrame();
+  }, [clips, assets, drawFrame]);
 
   // Store refs for audio data to avoid dependency issues
   const clipsRef = useRef(clips);
@@ -485,16 +662,18 @@ export function PreviewCanvas({
     trackSettingsRef.current = trackSettings;
   }, [clips, assets, volume, trackSettings]);
 
-  // Handle audio playback - ONLY depends on isPlaying to prevent multiple effect runs
+  // Handle audio playback - mirrors video transition detection pattern
+  // ONLY starts/stops audio on clip transitions, never re-syncs time during playback
   useEffect(() => {
     // Stop audio when not playing
     if (!isPlaying) {
       AudioManager.stop();
+      currentAudioClipIdRef.current = null;
       return;
     }
 
-    // Function to find and play the active audio clip
-    const syncAudio = () => {
+    // Function to check for audio clip transitions (NOT continuous time sync)
+    const checkAudioTransition = () => {
       const currentPosition = playheadPositionRef.current;
       const currentClips = clipsRef.current;
       const currentAssets = assetsRef.current;
@@ -514,15 +693,23 @@ export function PreviewCanvas({
 
       if (audioClip) {
         const asset = currentAssets.find(a => a.id === audioClip.assetId);
-        if (asset) {
-          const trackSetting = currentTrackSettings[audioClip.trackIndex] || { volume: 1, speed: 1, visible: true, muted: false };
-          const clipVolume = audioClip.volume ?? 1;
-          const finalVolume = currentVolume * trackSetting.volume * clipVolume;
-          const clipSpeed = audioClip.speed ?? 1;
+        if (!asset) return;
+
+        const trackSetting = currentTrackSettings[audioClip.trackIndex] || { volume: 1, speed: 1, visible: true, muted: false };
+        const clipVolume = audioClip.volume ?? 1;
+        const finalVolume = currentVolume * trackSetting.volume * clipVolume;
+        const clipSpeed = audioClip.speed ?? 1;
+
+        // Check if this is a DIFFERENT clip (transition)
+        const clipChanged = currentAudioClipIdRef.current !== audioClip.id;
+
+        if (clipChanged) {
+          // NEW clip - start fresh with correct time position
+          currentAudioClipIdRef.current = audioClip.id;
           const clipTrimStart = audioClip.trimStart ?? 0;
           const clipTime = currentPosition - audioClip.startTime + clipTrimStart;
 
-          AudioManager.play(
+          AudioManager.startClip(
             audioClip.id,
             asset.src,
             asset.file,
@@ -530,22 +717,29 @@ export function PreviewCanvas({
             finalVolume,
             trackSetting.speed * clipSpeed
           );
+        } else {
+          // SAME clip - just update volume/speed, don't touch time
+          AudioManager.updateSettings(finalVolume, trackSetting.speed * clipSpeed);
         }
       } else {
-        // No audio clip at current position - stop any playing audio
-        AudioManager.stop();
+        // No audio clip at current position - stop if was playing
+        if (currentAudioClipIdRef.current !== null) {
+          AudioManager.stop();
+          currentAudioClipIdRef.current = null;
+        }
       }
     };
 
     // Run immediately
-    syncAudio();
+    checkAudioTransition();
 
-    // Sync periodically while playing
-    const syncInterval = window.setInterval(syncAudio, 100);
+    // Check for clip transitions periodically (lightweight - no time sync)
+    const transitionCheckInterval = window.setInterval(checkAudioTransition, 100);
 
     return () => {
-      clearInterval(syncInterval);
+      clearInterval(transitionCheckInterval);
       AudioManager.stop();
+      currentAudioClipIdRef.current = null;
     };
   }, [isPlaying]); // ONLY depend on isPlaying - refs handle everything else
 

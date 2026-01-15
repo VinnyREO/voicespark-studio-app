@@ -37,6 +37,7 @@ export interface EditorState {
   volume: number; // 0-1
   duration: number; // total timeline duration in seconds
   trackSettings: Record<number, { volume: number; speed: number; visible: boolean; muted: boolean }>; // track-level settings
+  seekVersion?: number; // Increments on explicit user seeks to trigger media sync
 }
 
 export interface EditorAction {
