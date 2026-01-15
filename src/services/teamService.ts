@@ -247,8 +247,11 @@ export async function acceptInvitation(invitationId: string): Promise<void> {
   const { data: { user } } = await supabase.auth.getUser();
   if (!user || !user.email) throw new Error('Not authenticated');
 
+  console.log('[teamService] acceptInvitation - invitationId:', invitationId);
+  console.log('[teamService] acceptInvitation - user:', user.id, user.email);
+
   // Update only if the invitation matches the current user's email
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from('team_members')
     .update({
       member_user_id: user.id,
@@ -256,14 +259,21 @@ export async function acceptInvitation(invitationId: string): Promise<void> {
       accepted_at: new Date().toISOString(),
     })
     .eq('id', invitationId)
-    .eq('member_email', user.email.toLowerCase());
+    .eq('member_email', user.email.toLowerCase())
+    .select();
+
+  console.log('[teamService] acceptInvitation - result:', data, 'error:', error);
 
   if (error) {
     console.error('[teamService] Failed to accept invitation:', error);
     throw error;
   }
 
-  console.log('[teamService] Invitation accepted');
+  if (!data || data.length === 0) {
+    console.warn('[teamService] No rows updated - invitation may not exist or email mismatch');
+  }
+
+  console.log('[teamService] Invitation accepted successfully');
 }
 
 /**
@@ -401,12 +411,17 @@ export async function getSharedProjects(): Promise<Array<{
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) throw new Error('Not authenticated');
 
-  // Get all accepted team memberships
+  console.log('[teamService] getSharedProjects - user:', user.id, user.email);
+
+  // Get all accepted team memberships - query by BOTH member_user_id AND member_email
+  // This handles cases where the member_user_id might not be set yet
   const { data: memberships, error: membershipError } = await supabase
     .from('team_members')
-    .select('owner_id, project_id, access_scope, role')
-    .eq('member_user_id', user.id)
-    .eq('invitation_status', 'accepted');
+    .select('owner_id, project_id, access_scope, role, member_user_id, member_email')
+    .eq('invitation_status', 'accepted')
+    .or(`member_user_id.eq.${user.id},member_email.eq.${user.email?.toLowerCase()}`);
+
+  console.log('[teamService] getSharedProjects - memberships:', memberships, 'error:', membershipError);
 
   if (membershipError) throw membershipError;
   if (!memberships || memberships.length === 0) return [];
