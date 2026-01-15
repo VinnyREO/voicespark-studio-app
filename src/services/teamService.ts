@@ -421,10 +421,17 @@ export async function getSharedProjects(): Promise<Array<{
     .eq('invitation_status', 'accepted')
     .or(`member_user_id.eq.${user.id},member_email.eq.${user.email?.toLowerCase()}`);
 
-  console.log('[teamService] getSharedProjects - memberships:', memberships, 'error:', membershipError);
+  console.log('[teamService] getSharedProjects - memberships:', {
+    count: memberships?.length,
+    data: memberships,
+    error: membershipError?.message,
+  });
 
   if (membershipError) throw membershipError;
-  if (!memberships || memberships.length === 0) return [];
+  if (!memberships || memberships.length === 0) {
+    console.log('[teamService] getSharedProjects - No accepted memberships found');
+    return [];
+  }
 
   // Separate workspace and project memberships
   const workspaceOwnerIds = memberships
@@ -434,6 +441,9 @@ export async function getSharedProjects(): Promise<Array<{
   const projectIds = memberships
     .filter(m => m.access_scope === 'project' && m.project_id)
     .map(m => m.project_id!);
+
+  console.log('[teamService] getSharedProjects - workspaceOwnerIds:', workspaceOwnerIds);
+  console.log('[teamService] getSharedProjects - projectIds:', projectIds);
 
   const results: Array<{
     id: string;
@@ -446,10 +456,16 @@ export async function getSharedProjects(): Promise<Array<{
 
   // Get projects from workspace access
   if (workspaceOwnerIds.length > 0) {
-    const { data: workspaceProjects } = await supabase
+    const { data: workspaceProjects, error: wsError } = await supabase
       .from('projects')
       .select('id, name, owner_id, updated_at')
       .in('owner_id', workspaceOwnerIds);
+
+    console.log('[teamService] getSharedProjects - workspace projects:', {
+      count: workspaceProjects?.length,
+      data: workspaceProjects,
+      error: wsError?.message,
+    });
 
     if (workspaceProjects) {
       for (const project of workspaceProjects) {
@@ -467,10 +483,16 @@ export async function getSharedProjects(): Promise<Array<{
 
   // Get projects from project-specific access
   if (projectIds.length > 0) {
-    const { data: specificProjects } = await supabase
+    const { data: specificProjects, error: spError } = await supabase
       .from('projects')
       .select('id, name, owner_id, updated_at')
       .in('id', projectIds);
+
+    console.log('[teamService] getSharedProjects - specific projects:', {
+      count: specificProjects?.length,
+      data: specificProjects,
+      error: spError?.message,
+    });
 
     if (specificProjects) {
       for (const project of specificProjects) {

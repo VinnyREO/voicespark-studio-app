@@ -35,6 +35,22 @@ export async function listProjects(): Promise<Project[]> {
 
   if (!user) throw new Error('Not authenticated');
 
+  // DEBUG: First try without the owner_id filter to see if RLS is blocking
+  console.log('[projectService] DEBUG: Querying all projects (RLS will filter)...');
+  const { data: allData, error: allError } = await supabase
+    .from('projects')
+    .select('*')
+    .order('updated_at', { ascending: false });
+
+  console.log('[projectService] DEBUG: All projects (via RLS):', {
+    count: allData?.length,
+    projects: allData?.map(p => ({ id: p.id, name: p.name, owner_id: p.owner_id })),
+    error: allError?.message,
+    errorCode: allError?.code,
+    errorHint: allError?.hint,
+  });
+
+  // Original query with explicit owner_id filter
   const { data, error } = await supabase
     .from('projects')
     .select('*')
@@ -43,9 +59,12 @@ export async function listProjects(): Promise<Project[]> {
 
   console.log('[projectService] listProjects - result:', {
     count: data?.length,
+    projects: data?.map(p => ({ id: p.id, name: p.name, owner_id: p.owner_id })),
     error: error?.message,
     errorCode: error?.code,
-    errorDetails: error?.details
+    errorDetails: error?.details,
+    errorHint: error?.hint,
+    userIdUsedInQuery: user.id,
   });
 
   if (error) throw error;
