@@ -14,7 +14,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Progress } from '@/components/ui/progress';
 import { AspectRatio, MediaAsset, TimelineClip } from '@/types/video-editor';
 import { cn } from '@/lib/utils';
-import { exportVideo, quickExportOriginal } from '@/services/videoExporter';
+import { exportWithMediaRecorder } from '@/services/mediaRecorderExporter';
 
 interface ExportDialogProps {
   open: boolean;
@@ -123,40 +123,45 @@ export function ExportDialog({
   };
 
   const handleQuickExport = async () => {
-    console.log('[QuickExport] Starting quick export');
+    // Quick Export renders the full timeline at 720p using browser's MediaRecorder API
+    // No FFmpeg required - works instantly without any downloads
+    console.log('[QuickExport] Starting quick export (720p WebM using MediaRecorder)');
     setIsExporting(true);
     setExportProgress(0);
     setExportStatus('Preparing quick export...');
     setErrorMessage(null);
 
     try {
-      // Find the first visible clip's asset
-      const visibleClips = clips.filter(clip => {
-        const trackSetting = trackSettings[clip.trackIndex];
-        return !trackSetting || trackSetting.visible !== false;
+      const quickResolution = getResolution(aspectRatio, 'medium');
+      console.log('[QuickExport] Using resolution:', quickResolution);
+      console.log('[QuickExport] Clips to render:', clips.length);
+
+      // Use MediaRecorder-based export (no FFmpeg, works immediately)
+      const blob = await exportWithMediaRecorder({
+        clips,
+        assets,
+        resolution: quickResolution,
+        fps: 30,
+        trackSettings,
+        onProgress: (progress) => {
+          setExportProgress(progress);
+        },
+        onStatus: (status) => {
+          setExportStatus(status);
+        },
       });
 
-      if (visibleClips.length === 0) {
-        throw new Error('No visible clips to export');
-      }
+      console.log('[QuickExport] Video blob created:', blob.size, 'bytes');
 
-      // Get the first clip's asset
-      const firstClip = visibleClips[0];
-      const asset = assets.find((a) => a.id === firstClip.assetId);
-
-      if (!asset) {
-        throw new Error('Asset not found for the first clip');
-      }
-
-      if (asset.type !== 'video' && asset.type !== 'audio') {
-        throw new Error('Quick export only works with video or audio assets');
-      }
-
-      console.log('[QuickExport] Exporting asset:', asset.name);
-
-      await quickExportOriginal(asset, (status) => {
-        setExportStatus(status);
-      });
+      // Create download link
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `video-export-${Date.now()}.webm`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
 
       setExportProgress(100);
       setExportStatus('Export complete!');
@@ -179,6 +184,7 @@ export function ExportDialog({
   };
 
   const handleExport = async () => {
+    // Advanced Export uses MediaRecorder with selected quality settings
     console.log('[Export] Starting advanced export process');
     setIsExporting(true);
     setExportProgress(0);
@@ -190,12 +196,11 @@ export function ExportDialog({
       const resolution = getResolution(aspectRatio, quality);
       console.log('[Export] Target resolution:', resolution);
 
-      // Use the real video exporter
-      const blob = await exportVideo({
+      // Use MediaRecorder-based export (outputs WebM regardless of format selection)
+      const blob = await exportWithMediaRecorder({
         clips,
         assets,
         resolution,
-        format,
         fps: 30,
         trackSettings,
         onProgress: (progress) => {
@@ -208,11 +213,11 @@ export function ExportDialog({
 
       console.log('[Export] Video blob created:', blob.size, 'bytes');
 
-      // Create download link
+      // Create download link (always .webm since MediaRecorder outputs WebM)
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `video-export-${Date.now()}.${format}`;
+      a.download = `video-export-${Date.now()}.webm`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -235,7 +240,6 @@ export function ExportDialog({
       setErrorMessage(message);
       setExportStatus('');
       setIsExporting(false);
-      // Don't close dialog - let user see the error
     }
   };
 
@@ -384,9 +388,11 @@ export function ExportDialog({
             <div className="space-y-3">
               <div className="rounded-lg bg-blue-500/10 border border-blue-500/30 p-3">
                 <p className="text-xs text-muted-foreground">
-                  <span className="font-semibold text-foreground">Quick Export:</span> Downloads the original file instantly (guaranteed to work).
+                  <span className="font-semibold text-foreground">Quick Export:</span> Renders your full timeline at 720p WebM (faster).
                   <br />
-                  <span className="font-semibold text-foreground">Advanced Export:</span> Re-encodes with your quality settings (requires FFmpeg loading).
+                  <span className="font-semibold text-foreground">Advanced Export:</span> Renders with your selected quality (WebM format).
+                  <br />
+                  <span className="text-muted-foreground/70 italic">Export uses browser's native MediaRecorder - no downloads required.</span>
                 </p>
               </div>
 
@@ -424,8 +430,11 @@ export function ExportDialog({
               <Loader2 className="w-12 h-12 animate-spin text-primary" />
             </div>
             <div className="space-y-2">
-              <Progress value={exportProgress} className="h-2" />
-              <p className="text-sm text-center text-muted-foreground">{exportStatus}</p>
+              <Progress value={exportProgress} className="h-3" />
+              <div className="flex justify-between text-sm">
+                <span className="text-muted-foreground">{exportStatus}</span>
+                <span className="font-medium">{exportProgress}%</span>
+              </div>
             </div>
             <div className="flex justify-center pt-4">
               <Button

@@ -2,37 +2,28 @@ import { useEffect, useRef, useCallback } from 'react';
 import { AspectRatio as AspectRatioType, MediaAsset, TimelineClip } from '@/types/video-editor';
 import { cn } from '@/lib/utils';
 
-// Singleton Audio Manager - guarantees only ONE audio plays at a time globally
+// Multi-track Audio Manager - supports multiple simultaneous audio tracks
 // Key insight: Only start/stop on clip transitions, never sync time during playback
 const AudioManager = {
-  _audio: null as HTMLAudioElement | null,
-  _currentClipId: null as string | null,
+  _audioElements: new Map<string, HTMLAudioElement>(), // clipId -> audio element
   _blobUrls: new Map<string, string>(),
-  _isTransitioning: false, // Prevent race conditions during async operations
+  _transitioning: new Set<string>(), // Track which clips are currently transitioning
 
-  // Start playing a NEW clip - only call this on clip transitions
+  // Start playing a clip - supports multiple simultaneous clips
   startClip(clipId: string, src: string, file: File | undefined, startTime: number, volume: number, playbackRate: number) {
-    // Prevent re-entry during async operations
-    if (this._isTransitioning) return;
+    // Prevent re-entry during async operations for this specific clip
+    if (this._transitioning.has(clipId)) return;
 
-    // If same clip, don't restart - just update settings
-    if (this._currentClipId === clipId) {
-      this.updateSettings(volume, playbackRate);
+    // If same clip already playing, just update settings
+    const existingAudio = this._audioElements.get(clipId);
+    if (existingAudio) {
+      this.updateClipSettings(clipId, volume, playbackRate);
       return;
     }
 
-    this._isTransitioning = true;
+    this._transitioning.add(clipId);
 
-    // Stop current audio completely
-    if (this._audio) {
-      this._audio.pause();
-      this._audio.src = '';
-      this._audio = null;
-    }
-
-    this._currentClipId = clipId;
-
-    // Create new audio element
+    // Create new audio element for this clip
     const audio = new Audio();
     audio.preload = 'auto';
 
@@ -55,45 +46,64 @@ const AudioManager = {
     audio.currentTime = startTime;
 
     // Store reference before play
-    this._audio = audio;
+    this._audioElements.set(clipId, audio);
 
     // Play and handle completion
     audio.play()
       .then(() => {
-        this._isTransitioning = false;
+        this._transitioning.delete(clipId);
       })
       .catch(() => {
-        this._isTransitioning = false;
+        this._transitioning.delete(clipId);
       });
   },
 
-  // Update volume/speed without touching time or restarting
-  updateSettings(volume: number, playbackRate: number) {
-    if (this._audio) {
-      this._audio.volume = Math.min(1, Math.max(0, volume));
-      this._audio.playbackRate = playbackRate;
+  // Update volume/speed for a specific clip without touching time or restarting
+  updateClipSettings(clipId: string, volume: number, playbackRate: number) {
+    const audio = this._audioElements.get(clipId);
+    if (audio) {
+      audio.volume = Math.min(1, Math.max(0, volume));
+      audio.playbackRate = playbackRate;
     }
   },
 
+  // Stop a specific clip
+  stopClip(clipId: string) {
+    const audio = this._audioElements.get(clipId);
+    if (audio) {
+      audio.pause();
+      audio.src = '';
+      this._audioElements.delete(clipId);
+    }
+    this._transitioning.delete(clipId);
+  },
+
+  // Stop all audio
   stop() {
-    if (this._audio) {
-      this._audio.pause();
-      this._audio.src = '';
-      this._audio = null;
-    }
-    this._currentClipId = null;
-    this._isTransitioning = false;
+    this._audioElements.forEach((audio, clipId) => {
+      audio.pause();
+      audio.src = '';
+    });
+    this._audioElements.clear();
+    this._transitioning.clear();
   },
 
-  // Only call this for explicit user seeks (clicking timeline, dragging playhead)
-  syncTime(time: number) {
-    if (this._audio && !this._isTransitioning) {
-      this._audio.currentTime = time;
+  // Sync time for a specific clip (for explicit user seeks)
+  syncClipTime(clipId: string, time: number) {
+    const audio = this._audioElements.get(clipId);
+    if (audio && !this._transitioning.has(clipId)) {
+      audio.currentTime = time;
     }
   },
 
-  getCurrentClipId(): string | null {
-    return this._currentClipId;
+  // Get all currently playing clip IDs
+  getPlayingClipIds(): string[] {
+    return Array.from(this._audioElements.keys());
+  },
+
+  // Check if a specific clip is playing
+  isClipPlaying(clipId: string): boolean {
+    return this._audioElements.has(clipId);
   },
 
   cleanup() {
@@ -137,7 +147,6 @@ export function PreviewCanvas({
   const playheadPositionRef = useRef(playheadPosition);
   const lastSeekVersionRef = useRef(seekVersion);
   const currentVideoClipIdRef = useRef<string | null>(null);
-  const currentAudioClipIdRef = useRef<string | null>(null);
 
   const getAspectRatioDimensions = (ratio: AspectRatioType) => {
     switch (ratio) {
@@ -396,17 +405,22 @@ export function PreviewCanvas({
 
     // Only sync audio if currently playing - don't start audio when paused
     if (isPlaying) {
-      const audioClips = clips
-        .filter(clip => {
-          const clipAsset = assets.find(a => a.id === clip.assetId);
-          return clipAsset?.type === 'audio' &&
-                 playheadPosition >= clip.startTime &&
-                 playheadPosition < clip.startTime + clip.duration;
-        })
-        .sort((a, b) => a.trackIndex - b.trackIndex);
+      // Find ALL audio clips at the new position (multi-track support)
+      const audioClips = clips.filter(clip => {
+        const clipAsset = assets.find(a => a.id === clip.assetId);
+        const trackSetting = trackSettings[clip.trackIndex] || { volume: 1, speed: 1, visible: true, muted: false };
+        return clipAsset?.type === 'audio' &&
+               trackSetting.visible &&
+               !trackSetting.muted &&
+               playheadPosition >= clip.startTime &&
+               playheadPosition < clip.startTime + clip.duration;
+      });
 
-      const audioClip = audioClips[0];
-      if (audioClip) {
+      // Stop all audio and restart from new position for all active clips
+      AudioManager.stop();
+
+      // Start all audio clips at the seek position
+      audioClips.forEach(audioClip => {
         const audioAsset = assets.find(a => a.id === audioClip.assetId);
         if (audioAsset) {
           const trackSetting = trackSettings[audioClip.trackIndex] || { volume: 1, speed: 1, visible: true, muted: false };
@@ -416,9 +430,6 @@ export function PreviewCanvas({
           const clipTrimStart = audioClip.trimStart ?? 0;
           const audioClipTime = playheadPosition - audioClip.startTime + clipTrimStart;
 
-          // Stop current audio and restart from new position
-          AudioManager.stop();
-          currentAudioClipIdRef.current = audioClip.id;
           AudioManager.startClip(
             audioClip.id,
             audioAsset.src,
@@ -428,11 +439,7 @@ export function PreviewCanvas({
             trackSetting.speed * clipSpeed
           );
         }
-      } else {
-        // No audio clip at new position - stop any playing audio
-        AudioManager.stop();
-        currentAudioClipIdRef.current = null;
-      }
+      });
     }
   }, [seekVersion, playheadPosition, isPlaying, clips, assets, volume, trackSettings, drawFrame]);
 
@@ -662,26 +669,25 @@ export function PreviewCanvas({
     trackSettingsRef.current = trackSettings;
   }, [clips, assets, volume, trackSettings]);
 
-  // Handle audio playback - mirrors video transition detection pattern
+  // Handle audio playback - supports MULTIPLE simultaneous audio tracks
   // ONLY starts/stops audio on clip transitions, never re-syncs time during playback
   useEffect(() => {
-    // Stop audio when not playing
+    // Stop all audio when not playing
     if (!isPlaying) {
       AudioManager.stop();
-      currentAudioClipIdRef.current = null;
       return;
     }
 
     // Function to check for audio clip transitions (NOT continuous time sync)
-    const checkAudioTransition = () => {
+    const checkAudioTransitions = () => {
       const currentPosition = playheadPositionRef.current;
       const currentClips = clipsRef.current;
       const currentAssets = assetsRef.current;
       const currentVolume = volumeRef.current;
       const currentTrackSettings = trackSettingsRef.current;
 
-      // Find the first audio-only clip at current playhead position
-      const audioClip = currentClips.find(clip => {
+      // Find ALL audio clips at current playhead position (not just the first one)
+      const activeAudioClips = currentClips.filter(clip => {
         const asset = currentAssets.find(a => a.id === clip.assetId);
         const trackSetting = currentTrackSettings[clip.trackIndex] || { volume: 1, speed: 1, visible: true, muted: false };
         return asset?.type === 'audio' &&
@@ -691,7 +697,19 @@ export function PreviewCanvas({
                currentPosition < clip.startTime + clip.duration;
       });
 
-      if (audioClip) {
+      // Get currently playing clip IDs
+      const currentlyPlayingIds = new Set(AudioManager.getPlayingClipIds());
+      const activeClipIds = new Set(activeAudioClips.map(c => c.id));
+
+      // Stop clips that are no longer active
+      currentlyPlayingIds.forEach(clipId => {
+        if (!activeClipIds.has(clipId)) {
+          AudioManager.stopClip(clipId);
+        }
+      });
+
+      // Start new clips and update existing ones
+      activeAudioClips.forEach(audioClip => {
         const asset = currentAssets.find(a => a.id === audioClip.assetId);
         if (!asset) return;
 
@@ -700,12 +718,11 @@ export function PreviewCanvas({
         const finalVolume = currentVolume * trackSetting.volume * clipVolume;
         const clipSpeed = audioClip.speed ?? 1;
 
-        // Check if this is a DIFFERENT clip (transition)
-        const clipChanged = currentAudioClipIdRef.current !== audioClip.id;
-
-        if (clipChanged) {
-          // NEW clip - start fresh with correct time position
-          currentAudioClipIdRef.current = audioClip.id;
+        if (AudioManager.isClipPlaying(audioClip.id)) {
+          // Clip already playing - just update volume/speed
+          AudioManager.updateClipSettings(audioClip.id, finalVolume, trackSetting.speed * clipSpeed);
+        } else {
+          // New clip - start it
           const clipTrimStart = audioClip.trimStart ?? 0;
           const clipTime = currentPosition - audioClip.startTime + clipTrimStart;
 
@@ -717,29 +734,19 @@ export function PreviewCanvas({
             finalVolume,
             trackSetting.speed * clipSpeed
           );
-        } else {
-          // SAME clip - just update volume/speed, don't touch time
-          AudioManager.updateSettings(finalVolume, trackSetting.speed * clipSpeed);
         }
-      } else {
-        // No audio clip at current position - stop if was playing
-        if (currentAudioClipIdRef.current !== null) {
-          AudioManager.stop();
-          currentAudioClipIdRef.current = null;
-        }
-      }
+      });
     };
 
     // Run immediately
-    checkAudioTransition();
+    checkAudioTransitions();
 
     // Check for clip transitions periodically (lightweight - no time sync)
-    const transitionCheckInterval = window.setInterval(checkAudioTransition, 100);
+    const transitionCheckInterval = window.setInterval(checkAudioTransitions, 100);
 
     return () => {
       clearInterval(transitionCheckInterval);
       AudioManager.stop();
-      currentAudioClipIdRef.current = null;
     };
   }, [isPlaying]); // ONLY depend on isPlaying - refs handle everything else
 

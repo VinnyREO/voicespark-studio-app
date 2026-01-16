@@ -48,6 +48,8 @@ export function TimelineClip({
   const dragStartTime = useRef(0);
   const dragStartTrack = useRef(0);
   const dragStartDuration = useRef(0);
+  // Store initial positions of all selected clips when multi-drag starts
+  const multiDragStartPositions = useRef<Map<string, { startTime: number; trackIndex: number }>>(new Map());
 
   const widthPx = clip.duration * pixelsPerSecond;
   const leftPx = clip.startTime * pixelsPerSecond;
@@ -87,6 +89,9 @@ export function TimelineClip({
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     if (e.button !== 0) return; // Only left click
 
+    // Prevent text selection during drag
+    e.preventDefault();
+
     const rect = clipRef.current?.getBoundingClientRect();
     if (!rect) return;
 
@@ -112,10 +117,31 @@ export function TimelineClip({
       dragStartY.current = e.clientY;
       dragStartTime.current = clip.startTime;
       dragStartTrack.current = clip.trackIndex;
+
+      // Store initial positions of all selected clips for multi-drag
+      // Always include the current clip (it will be selected after onSelect)
+      // Also include all already-selected clips
+      multiDragStartPositions.current.clear();
+
+      // Always store the clicked clip's position
+      multiDragStartPositions.current.set(clip.id, {
+        startTime: clip.startTime,
+        trackIndex: clip.trackIndex,
+      });
+
+      // Store positions for all other selected clips
+      allClips.forEach(c => {
+        if (selectedClipIds.includes(c.id) && c.id !== clip.id) {
+          multiDragStartPositions.current.set(c.id, {
+            startTime: c.startTime,
+            trackIndex: c.trackIndex,
+          });
+        }
+      });
     }
 
     onSelect(e.shiftKey);
-  }, [clip.startTime, clip.trackIndex, clip.duration, onSelect]);
+  }, [clip.id, clip.startTime, clip.trackIndex, clip.duration, onSelect, selectedClipIds, allClips]);
 
   const handleMouseMove = useCallback((e: MouseEvent) => {
     if (isDragging) {
@@ -180,15 +206,32 @@ export function TimelineClip({
         newStartTime = Math.max(0, newStartTime);
       }
 
-      // If multiple clips are selected, move them all together
-      if (selectedClipIds.length > 1 && selectedClipIds.includes(clip.id) && onUpdateMultiple) {
+      // If multiple clips are being dragged, move them all together
+      // Use multiDragStartPositions.size to determine if we're doing a multi-drag
+      // (it was populated at drag start with all selected clips + the clicked clip)
+      if (multiDragStartPositions.current.size > 1 && onUpdateMultiple) {
+        // Calculate delta from the dragged clip's original position
         const timeDelta = newStartTime - dragStartTime.current;
         const trackIndexDelta = newTrackIndex - dragStartTrack.current;
 
-        onUpdateMultiple(selectedClipIds, (clipToUpdate) => ({
-          startTime: Math.max(0, clipToUpdate.startTime + timeDelta),
-          trackIndex: Math.max(0, clipToUpdate.trackIndex + trackIndexDelta),
-        }));
+        // Get all clip IDs that should be moved (from our stored positions)
+        const clipIdsToMove = Array.from(multiDragStartPositions.current.keys());
+
+        // Update all clips using their stored initial positions + delta
+        onUpdateMultiple(clipIdsToMove, (clipToUpdate) => {
+          const initialPos = multiDragStartPositions.current.get(clipToUpdate.id);
+          if (initialPos) {
+            return {
+              startTime: Math.max(0, initialPos.startTime + timeDelta),
+              trackIndex: Math.max(0, initialPos.trackIndex + trackIndexDelta),
+            };
+          }
+          // Fallback if initial position not found (shouldn't happen)
+          return {
+            startTime: Math.max(0, clipToUpdate.startTime + timeDelta),
+            trackIndex: Math.max(0, clipToUpdate.trackIndex + trackIndexDelta),
+          };
+        });
       } else {
         onUpdate({
           startTime: newStartTime,
@@ -225,15 +268,23 @@ export function TimelineClip({
   const handleMouseUp = useCallback(() => {
     setIsDragging(false);
     setIsResizing(null);
+    multiDragStartPositions.current.clear();
   }, []);
 
   useEffect(() => {
     if (isDragging || isResizing) {
+      // Prevent text selection globally while dragging
+      document.body.style.userSelect = 'none';
+      document.body.style.webkitUserSelect = 'none';
+
       document.addEventListener('mousemove', handleMouseMove);
       document.addEventListener('mouseup', handleMouseUp);
       return () => {
         document.removeEventListener('mousemove', handleMouseMove);
         document.removeEventListener('mouseup', handleMouseUp);
+        // Re-enable text selection when done
+        document.body.style.userSelect = '';
+        document.body.style.webkitUserSelect = '';
       };
     }
   }, [isDragging, isResizing, handleMouseMove, handleMouseUp]);
@@ -247,7 +298,7 @@ export function TimelineClip({
         onMouseDown={handleMouseDown}
         onContextMenu={handleContextMenu}
         className={cn(
-          'absolute h-12 rounded-sm border overflow-hidden',
+          'absolute h-12 rounded-sm border overflow-hidden select-none',
           getClipColor(),
           isSelected && 'ring-2 ring-primary border-primary',
           isDragging && 'opacity-70 cursor-move z-50',

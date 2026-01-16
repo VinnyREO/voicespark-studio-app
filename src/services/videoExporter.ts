@@ -36,13 +36,54 @@ export async function quickExportOriginal(asset: MediaAsset, onStatus?: (status:
   }
 }
 
+// Helper to wrap load with timeout
+async function loadWithTimeout(
+  ff: FFmpeg,
+  config: { coreURL: string; wasmURL: string; workerURL?: string },
+  timeoutMs: number
+): Promise<void> {
+  const loadStart = Date.now();
+  console.log('[FFmpeg] Calling ffmpeg.load() with config:', {
+    coreURL: config.coreURL.substring(0, 50) + '...',
+    wasmURL: config.wasmURL.substring(0, 50) + '...',
+    workerURL: config.workerURL ? config.workerURL.substring(0, 50) + '...' : 'none',
+  });
+
+  const loadPromise = ff.load(config);
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    setTimeout(() => {
+      const elapsed = ((Date.now() - loadStart) / 1000).toFixed(1);
+      reject(new Error(`FFmpeg initialization timed out after ${elapsed}s. The WASM module failed to initialize.`));
+    }, timeoutMs);
+  });
+
+  await Promise.race([loadPromise, timeoutPromise]);
+  console.log('[FFmpeg] ffmpeg.load() completed in', Date.now() - loadStart, 'ms');
+}
+
 export async function initFFmpeg(onProgress?: (progress: number) => void, onStatus?: (status: string) => void): Promise<FFmpeg> {
   // Return cached instance if already loaded
   if (ffmpeg && ffmpegLoaded) {
+    console.log('[FFmpeg] Using cached instance');
     return ffmpeg;
   }
 
   console.log('[FFmpeg] Initializing new FFmpeg instance');
+
+  // Check browser capabilities
+  const hasSharedArrayBuffer = typeof SharedArrayBuffer !== 'undefined';
+  const isCrossOriginIsolated = typeof window !== 'undefined' && window.crossOriginIsolated;
+  console.log('[FFmpeg] Browser capabilities:');
+  console.log(`  - SharedArrayBuffer available: ${hasSharedArrayBuffer}`);
+  console.log(`  - crossOriginIsolated: ${isCrossOriginIsolated}`);
+
+  if (!hasSharedArrayBuffer || !isCrossOriginIsolated) {
+    throw new Error(
+      'FFmpeg requires SharedArrayBuffer which needs Cross-Origin-Isolation headers. ' +
+      'Please ensure the server is configured with COOP/COEP headers.'
+    );
+  }
+
   ffmpeg = new FFmpeg();
 
   if (onProgress) {
@@ -55,87 +96,93 @@ export async function initFFmpeg(onProgress?: (progress: number) => void, onStat
     console.log('[FFmpeg Log]', message);
   });
 
-  // Try multiple approaches in order of compatibility
-  const approaches = [
-    {
-      name: 'Direct URLs (fastest)',
-      load: async () => {
-        const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
-        onStatus?.('Loading FFmpeg (direct)...');
+  const startTime = Date.now();
+  const INIT_TIMEOUT = 60000; // 60 second timeout for initialization
 
-        await ffmpeg!.load({
-          coreURL: `${baseURL}/ffmpeg-core.js`,
-          wasmURL: `${baseURL}/ffmpeg-core.wasm`,
-        });
-      }
-    },
-    {
-      name: 'jsDelivr CDN',
-      load: async () => {
-        const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
-        onStatus?.('Loading FFmpeg (jsDelivr)...');
+  // Use multi-threaded FFmpeg core (@ffmpeg/core-mt) which requires worker file
+  // This works when SharedArrayBuffer is available (with COOP/COEP headers)
+  const baseURL = 'https://unpkg.com/@ffmpeg/core-mt@0.12.6/dist/umd';
 
-        await ffmpeg!.load({
-          coreURL: `${baseURL}/ffmpeg-core.js`,
-          wasmURL: `${baseURL}/ffmpeg-core.wasm`,
-        });
-      }
-    },
-    {
-      name: 'Blob URLs from unpkg',
-      load: async () => {
-        const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
-        onStatus?.('Loading FFmpeg (blob conversion)...');
+  try {
+    console.log('[FFmpeg] Loading multi-threaded FFmpeg from unpkg CDN...');
+    onStatus?.('Loading video engine...');
 
-        const coreURL = await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript');
-        const wasmURL = await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm');
+    // Download all THREE required files for multi-threaded FFmpeg
+    console.log('[FFmpeg] Downloading ffmpeg-core.js...');
+    const coreURL = await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript');
+    console.log('[FFmpeg] core.js downloaded');
 
-        await ffmpeg!.load({ coreURL, wasmURL });
-      }
-    },
-  ];
+    console.log('[FFmpeg] Downloading ffmpeg-core.wasm (~32MB)...');
+    onStatus?.('Downloading video engine (~32MB)...');
+    const wasmURL = await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm');
+    console.log('[FFmpeg] WASM downloaded');
 
-  let lastError: Error | null = null;
+    console.log('[FFmpeg] Downloading ffmpeg-core.worker.js...');
+    const workerURL = await toBlobURL(`${baseURL}/ffmpeg-core.worker.js`, 'text/javascript');
+    console.log('[FFmpeg] Worker downloaded');
 
-  for (const approach of approaches) {
-    try {
-      console.log(`[FFmpeg] Attempting: ${approach.name}`);
+    console.log('[FFmpeg] All 3 files downloaded, initializing WASM with worker...');
+    onStatus?.('Initializing video engine...');
 
-      // 20 second timeout per attempt
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        setTimeout(() => reject(new Error('Timeout after 20 seconds')), 20000);
-      });
+    // Load FFmpeg with all three URLs (multi-threaded requires worker)
+    await loadWithTimeout(ffmpeg, { coreURL, wasmURL, workerURL }, INIT_TIMEOUT);
 
-      await Promise.race([approach.load(), timeoutPromise]);
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[FFmpeg] Loaded successfully in ${elapsed}s`);
+    ffmpegLoaded = true;
+    onStatus?.('Video engine ready!');
+    return ffmpeg;
 
-      console.log(`[FFmpeg] SUCCESS with: ${approach.name}`);
-      ffmpegLoaded = true;
-      return ffmpeg;
+  } catch (error) {
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.error(`[FFmpeg] Failed to load after ${elapsed}s:`, error);
 
-    } catch (error) {
-      console.error(`[FFmpeg] Failed with ${approach.name}:`, error);
-      lastError = error instanceof Error ? error : new Error(`Failed: ${approach.name}`);
-      // Continue to next approach
-      ffmpegLoaded = false;
-      ffmpeg = new FFmpeg(); // Create fresh instance for next attempt
-
-      if (onProgress) {
-        ffmpeg.on('progress', ({ progress }) => {
-          onProgress(Math.round(progress * 100));
-        });
-      }
-      ffmpeg.on('log', ({ message }) => {
-        console.log('[FFmpeg Log]', message);
+    // Reset for retry
+    ffmpeg = new FFmpeg();
+    if (onProgress) {
+      ffmpeg.on('progress', ({ progress }) => {
+        onProgress(Math.round(progress * 100));
       });
     }
-  }
+    ffmpeg.on('log', ({ message }) => {
+      console.log('[FFmpeg Log]', message);
+    });
 
-  // All approaches failed
-  ffmpeg = null;
-  throw new Error(
-    `Could not load FFmpeg after trying all methods. Last error: ${lastError?.message}. ` +
-    'Please use "Quick Export (Original)" instead, or try a different browser.'
-  );
+    // Try jsDelivr as fallback
+    console.log('[FFmpeg] Trying jsDelivr fallback...');
+    onStatus?.('Trying alternative source...');
+
+    const fallbackURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.12.6/dist/umd';
+
+    try {
+      console.log('[FFmpeg] Downloading from jsDelivr...');
+      const coreURL = await toBlobURL(`${fallbackURL}/ffmpeg-core.js`, 'text/javascript');
+      const wasmURL = await toBlobURL(`${fallbackURL}/ffmpeg-core.wasm`, 'application/wasm');
+      const workerURL = await toBlobURL(`${fallbackURL}/ffmpeg-core.worker.js`, 'text/javascript');
+
+      console.log('[FFmpeg] jsDelivr files downloaded, initializing...');
+      onStatus?.('Initializing video engine...');
+
+      await loadWithTimeout(ffmpeg, { coreURL, wasmURL, workerURL }, INIT_TIMEOUT);
+
+      const elapsed2 = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`[FFmpeg] Loaded from jsDelivr in ${elapsed2}s`);
+      ffmpegLoaded = true;
+      onStatus?.('Video engine ready!');
+      return ffmpeg;
+
+    } catch (fallbackError) {
+      ffmpeg = null;
+      const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.error(`[FFmpeg] All sources failed after ${totalTime}s:`, fallbackError);
+
+      const errorMsg = fallbackError instanceof Error ? fallbackError.message : 'Unknown error';
+      throw new Error(
+        `Could not initialize video engine after ${totalTime}s. ${errorMsg}. ` +
+        'Please refresh the page and try again.'
+      );
+    }
+  }
 }
 
 interface ExportOptions {
@@ -159,19 +206,14 @@ export async function exportVideo({
   onProgress,
   onStatus,
 }: ExportOptions): Promise<Blob> {
-  console.log('[VideoExporter] Starting export with:', {
-    clipCount: clips.length,
-    assetCount: assets.length,
-    resolution,
-    format,
-    fps
-  });
+  console.log('[VideoExporter] ========== STARTING EXPORT ==========');
+  console.log('[VideoExporter] Config:', { clipCount: clips.length, assetCount: assets.length, resolution, format, fps });
 
   onStatus?.('Loading FFmpeg (first time may take a moment)...');
-  const ff = await initFFmpeg(onProgress);
+  const ff = await initFFmpeg(onProgress, onStatus);
   console.log('[VideoExporter] FFmpeg initialized successfully');
 
-  // Filter visible clips and sort by track and time
+  // Filter visible clips and sort by start time (lower track index = higher priority for same time)
   const visibleClips = clips.filter(clip => {
     const trackSetting = trackSettings[clip.trackIndex];
     return !trackSetting || trackSetting.visible !== false;
@@ -186,12 +228,16 @@ export async function exportVideo({
   onStatus?.('Preparing media files...');
   onProgress?.(10);
 
-  // Write input files to FFmpeg virtual filesystem
+  // Write input files to FFmpeg virtual filesystem and track which have audio
   const processedClips: Array<{
     inputName: string;
+    inputIndex: number;
     clip: TimelineClip;
     asset: MediaAsset;
+    hasAudio: boolean; // Track whether this input has an audio stream
   }> = [];
+
+  let inputIdx = 0;
 
   for (let i = 0; i < visibleClips.length; i++) {
     const clip = visibleClips[i];
@@ -209,168 +255,297 @@ export async function exportVideo({
     }
 
     try {
-      console.log(`[VideoExporter] Processing clip ${i + 1}/${visibleClips.length}: ${asset.name}`);
+      console.log(`[VideoExporter] Loading clip ${i + 1}/${visibleClips.length}: ${asset.name} (${asset.type})`);
 
-      // Fetch the file data
       const fileData = await fetchFile(asset.src);
 
       if (!fileData || fileData.byteLength === 0) {
         throw new Error(`File is empty or could not be loaded: ${asset.name}`);
       }
 
-      const inputName = `input${i}.${asset.type === 'video' ? 'mp4' : 'mp3'}`;
+      const ext = asset.type === 'video' ? 'mp4' : 'mp3';
+      const inputName = `input${inputIdx}.${ext}`;
       await ff.writeFile(inputName, fileData);
 
-      processedClips.push({ inputName, clip, asset });
+      processedClips.push({
+        inputName,
+        inputIndex: inputIdx,
+        clip,
+        asset,
+        hasAudio: asset.type === 'audio', // Audio files always have audio, video we'll assume true initially
+      });
+      inputIdx++;
     } catch (error) {
       console.error(`[VideoExporter] Failed to process clip ${clip.id}:`, error);
-
-      // Provide more specific error messages
       let errorMsg = `Failed to load media file: ${asset.name}`;
       if (error instanceof Error) {
-        if (error.message.includes('CORS') || error.message.includes('cross-origin')) {
-          errorMsg += '. CORS Error: The video file cannot be accessed due to browser security restrictions. Try using locally uploaded files instead of URLs.';
-        } else if (error.message.includes('NetworkError') || error.message.includes('Failed to fetch')) {
-          errorMsg += '. Network Error: Could not download the file. Check your internet connection.';
-        } else {
-          errorMsg += `. ${error.message}`;
-        }
+        errorMsg += `. ${error.message}`;
       }
-
       throw new Error(errorMsg);
     }
   }
 
-  console.log(`[VideoExporter] Successfully processed ${processedClips.length} clips`);
+  console.log(`[VideoExporter] Successfully loaded ${processedClips.length} clips`);
 
   if (processedClips.length === 0) {
     throw new Error('No valid video or audio clips found');
   }
 
+  // Separate video and audio clips
+  const videoClips = processedClips.filter(pc => pc.asset.type === 'video');
+  const audioOnlyClips = processedClips.filter(pc => pc.asset.type === 'audio');
+
+  // Calculate total timeline duration
+  let totalDuration = 0;
+  for (const pc of processedClips) {
+    const clipEnd = pc.clip.startTime + pc.clip.duration;
+    totalDuration = Math.max(totalDuration, clipEnd);
+  }
+
+  console.log('[VideoExporter] Timeline analysis:');
+  console.log(`  - Video clips: ${videoClips.length}`);
+  console.log(`  - Audio-only clips: ${audioOnlyClips.length}`);
+  console.log(`  - Total duration: ${totalDuration.toFixed(2)}s`);
+
+  // Log each clip for debugging
+  for (const pc of processedClips) {
+    const trackSetting = trackSettings[pc.clip.trackIndex] || { volume: 1, muted: false };
+    console.log(`  - [${pc.asset.type}] "${pc.asset.name}" @ ${pc.clip.startTime.toFixed(2)}s, dur=${pc.clip.duration.toFixed(2)}s, track=${pc.clip.trackIndex}, muted=${trackSetting.muted}`);
+  }
+
   onStatus?.('Building timeline...');
   onProgress?.(30);
 
-  // Create a filter complex to handle timeline composition
-  // For simplicity, we'll concatenate clips in sequence
-  // In a full implementation, you'd handle overlapping tracks, transitions, etc.
-
   const outputName = `output.${format}`;
 
-  if (processedClips.length === 1) {
-    // Single clip - simple re-encode with settings
-    const { inputName, clip, asset } = processedClips[0];
-    const trackSetting = trackSettings[clip.trackIndex] || { volume: 1, speed: 1, visible: true, muted: false };
+  // Build FFmpeg command with proper video/audio mixing
+  const buildFFmpegCommand = (skipVideoAudio: boolean): string[] => {
+    const args: string[] = [];
+    const filterParts: string[] = [];
+    const audioStreams: string[] = [];
 
-    onStatus?.('Encoding video...');
-    onProgress?.(50);
+    // === INPUT 0: Black background video spanning entire timeline ===
+    args.push('-f', 'lavfi', '-i', `color=c=black:s=${resolution.width}x${resolution.height}:d=${totalDuration}:r=${fps}`);
 
-    const ffmpegArgs = [
-      '-i', inputName,
-      // Trim clip
-      '-ss', clip.trimStart.toString(),
-      '-t', clip.duration.toString(),
-      // Video settings
-      '-vf', `scale=${resolution.width}:${resolution.height}:force_original_aspect_ratio=decrease,pad=${resolution.width}:${resolution.height}:(ow-iw)/2:(oh-ih)/2`,
-      '-r', fps.toString(),
-    ];
-
-    // Video codec based on format
-    if (format === 'mp4') {
-      ffmpegArgs.push('-c:v', 'libx264', '-preset', 'fast', '-crf', '23');
-    } else if (format === 'webm') {
-      ffmpegArgs.push('-c:v', 'libvpx-vp9', '-b:v', '2M');
-    } else {
-      // MOV
-      ffmpegArgs.push('-c:v', 'libx264', '-preset', 'fast', '-crf', '18');
+    // === INPUTS 1+: All media files ===
+    for (const pc of processedClips) {
+      args.push('-i', pc.inputName);
     }
 
-    // Audio settings
-    if (asset.type === 'video' || asset.type === 'audio') {
-      if (trackSetting.muted || (clip.volume !== undefined && clip.volume === 0)) {
-        ffmpegArgs.push('-an'); // No audio
-      } else {
-        const volumeMultiplier = (clip.volume ?? 1) * trackSetting.volume;
-        ffmpegArgs.push(
-          '-af', `volume=${volumeMultiplier}`,
-          '-c:a', format === 'webm' ? 'libopus' : 'aac',
-          '-b:a', '128k'
+    // === VIDEO PROCESSING ===
+    // Strategy: Start with black background, overlay each video clip using 'enable' for timing
+    if (videoClips.length > 0) {
+      let currentBase = '[0:v]';
+
+      for (let i = 0; i < videoClips.length; i++) {
+        const vc = videoClips[i];
+        const inputNum = vc.inputIndex + 1; // +1 because input 0 is the black background
+        const clipStart = vc.clip.startTime;
+        const clipEnd = vc.clip.startTime + vc.clip.duration;
+        const trimStart = vc.clip.trimStart;
+        const clipDuration = vc.clip.duration;
+
+        // Prepare video: trim, scale, pad to fit resolution
+        const prepLabel = `vprep${i}`;
+        filterParts.push(
+          `[${inputNum}:v]trim=start=${trimStart}:duration=${clipDuration},setpts=PTS-STARTPTS,` +
+          `scale=${resolution.width}:${resolution.height}:force_original_aspect_ratio=decrease,` +
+          `pad=${resolution.width}:${resolution.height}:(ow-iw)/2:(oh-ih)/2,fps=${fps}[${prepLabel}]`
         );
+
+        // Overlay on current base with enable filter for timing
+        const isLast = i === videoClips.length - 1;
+        const outLabel = isLast ? '[vout]' : `[vbase${i}]`;
+
+        // Use enable to show overlay only during the clip's time window
+        filterParts.push(
+          `${currentBase}[${prepLabel}]overlay=0:0:enable='between(t,${clipStart},${clipEnd})'${outLabel}`
+        );
+
+        currentBase = outLabel;
+      }
+    } else {
+      // No video clips - use black background directly
+      filterParts.push(`[0:v]null[vout]`);
+    }
+
+    // === AUDIO PROCESSING ===
+    // Process ALL audio sources: video file audio + standalone audio files
+
+    // 1. Audio from video clips (if not skipped and not muted)
+    if (!skipVideoAudio) {
+      for (let i = 0; i < videoClips.length; i++) {
+        const vc = videoClips[i];
+        const inputNum = vc.inputIndex + 1;
+        const trackSetting = trackSettings[vc.clip.trackIndex] || { volume: 1, muted: false };
+
+        if (trackSetting.muted || vc.clip.volume === 0) {
+          console.log(`[VideoExporter] Skipping muted video audio: ${vc.asset.name}`);
+          continue;
+        }
+
+        const volume = (vc.clip.volume ?? 1) * (trackSetting.volume ?? 1);
+        const delayMs = Math.round(vc.clip.startTime * 1000);
+        const trimStart = vc.clip.trimStart;
+        const clipDuration = vc.clip.duration;
+        const audioLabel = `va${i}`;
+
+        console.log(`[VideoExporter] Adding video audio: ${vc.asset.name}, delay=${delayMs}ms, vol=${volume}`);
+
+        filterParts.push(
+          `[${inputNum}:a]atrim=start=${trimStart}:duration=${clipDuration},asetpts=PTS-STARTPTS,` +
+          `volume=${volume},adelay=${delayMs}|${delayMs}[${audioLabel}]`
+        );
+        audioStreams.push(`[${audioLabel}]`);
       }
     }
 
-    ffmpegArgs.push(outputName);
+    // 2. Audio from standalone audio clips (MP3, etc.)
+    for (let i = 0; i < audioOnlyClips.length; i++) {
+      const ac = audioOnlyClips[i];
+      const inputNum = ac.inputIndex + 1;
+      const trackSetting = trackSettings[ac.clip.trackIndex] || { volume: 1, muted: false };
 
-    console.log('[VideoExporter] FFmpeg command:', ffmpegArgs.join(' '));
-    await ff.exec(ffmpegArgs);
-    console.log('[VideoExporter] FFmpeg encoding complete');
+      if (trackSetting.muted || ac.clip.volume === 0) {
+        console.log(`[VideoExporter] Skipping muted audio clip: ${ac.asset.name}`);
+        continue;
+      }
 
-  } else {
-    // Multiple clips - concatenate
-    onStatus?.('Encoding and concatenating clips...');
-    onProgress?.(50);
+      const volume = (ac.clip.volume ?? 1) * (trackSetting.volume ?? 1);
+      const delayMs = Math.round(ac.clip.startTime * 1000);
+      const trimStart = ac.clip.trimStart;
+      const clipDuration = ac.clip.duration;
+      const audioLabel = `a${i}`;
 
-    // Create concat file listing all inputs
-    let concatContent = '';
-    for (const { inputName } of processedClips) {
-      concatContent += `file '${inputName}'\n`;
+      console.log(`[VideoExporter] Adding audio clip: ${ac.asset.name}, delay=${delayMs}ms, vol=${volume}, duration=${clipDuration}s`);
+
+      filterParts.push(
+        `[${inputNum}:a]atrim=start=${trimStart}:duration=${clipDuration},asetpts=PTS-STARTPTS,` +
+        `volume=${volume},adelay=${delayMs}|${delayMs}[${audioLabel}]`
+      );
+      audioStreams.push(`[${audioLabel}]`);
     }
-    await ff.writeFile('concat.txt', concatContent);
 
-    const ffmpegArgs = [
-      '-f', 'concat',
-      '-safe', '0',
-      '-i', 'concat.txt',
-      '-vf', `scale=${resolution.width}:${resolution.height}:force_original_aspect_ratio=decrease,pad=${resolution.width}:${resolution.height}:(ow-iw)/2:(oh-ih)/2`,
-      '-r', fps.toString(),
-    ];
+    // Mix all audio streams
+    let audioOutputLabel = '';
+    if (audioStreams.length > 1) {
+      filterParts.push(
+        `${audioStreams.join('')}amix=inputs=${audioStreams.length}:duration=longest:dropout_transition=0[aout]`
+      );
+      audioOutputLabel = '[aout]';
+    } else if (audioStreams.length === 1) {
+      audioOutputLabel = audioStreams[0];
+    }
+
+    console.log(`[VideoExporter] Audio streams to mix: ${audioStreams.length}`);
+
+    // Build filter_complex
+    const filterComplex = filterParts.join(';');
+    console.log('[VideoExporter] Filter complex:', filterComplex);
+
+    args.push('-filter_complex', filterComplex);
+
+    // Map video output (ALWAYS)
+    args.push('-map', '[vout]');
+
+    // Map audio output (if any)
+    if (audioOutputLabel) {
+      args.push('-map', audioOutputLabel);
+    }
+
+    // Set output duration
+    args.push('-t', totalDuration.toString());
 
     // Video codec
     if (format === 'mp4') {
-      ffmpegArgs.push('-c:v', 'libx264', '-preset', 'fast', '-crf', '23');
+      args.push('-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p');
     } else if (format === 'webm') {
-      ffmpegArgs.push('-c:v', 'libvpx-vp9', '-b:v', '2M');
+      args.push('-c:v', 'libvpx-vp9', '-b:v', '2M');
     } else {
-      ffmpegArgs.push('-c:v', 'libx264', '-preset', 'fast', '-crf', '18');
+      args.push('-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p');
     }
 
-    // Audio
-    ffmpegArgs.push('-c:a', format === 'webm' ? 'libopus' : 'aac', '-b:a', '128k');
+    // Audio codec
+    if (audioOutputLabel) {
+      args.push('-c:a', format === 'webm' ? 'libopus' : 'aac', '-b:a', '192k');
+    } else {
+      args.push('-an');
+    }
 
-    ffmpegArgs.push(outputName);
+    args.push('-y', outputName);
 
-    console.log('[VideoExporter] FFmpeg command (concat):', ffmpegArgs.join(' '));
+    return args;
+  };
+
+  onStatus?.('Encoding video...');
+  onProgress?.(50);
+
+  // Try with video audio first
+  let success = false;
+  try {
+    const ffmpegArgs = buildFFmpegCommand(false);
+    console.log('[VideoExporter] FFmpeg command:', ffmpegArgs.join(' '));
     await ff.exec(ffmpegArgs);
-    console.log('[VideoExporter] FFmpeg concatenation complete');
+    success = true;
+    console.log('[VideoExporter] FFmpeg encoding succeeded (with video audio)');
+  } catch (firstError) {
+    console.warn('[VideoExporter] First attempt failed (might be missing audio in video):', firstError);
+
+    // Retry without video audio (in case video files don't have audio streams)
+    if (videoClips.length > 0 && audioOnlyClips.length > 0) {
+      try {
+        onStatus?.('Retrying without video audio...');
+        const ffmpegArgs = buildFFmpegCommand(true);
+        console.log('[VideoExporter] FFmpeg command (retry):', ffmpegArgs.join(' '));
+        await ff.exec(ffmpegArgs);
+        success = true;
+        console.log('[VideoExporter] FFmpeg encoding succeeded (without video audio)');
+      } catch (secondError) {
+        console.error('[VideoExporter] Second attempt also failed:', secondError);
+        throw secondError;
+      }
+    } else if (audioOnlyClips.length > 0) {
+      // Only audio clips exist - try without any video audio
+      try {
+        onStatus?.('Retrying with audio-only clips...');
+        const ffmpegArgs = buildFFmpegCommand(true);
+        console.log('[VideoExporter] FFmpeg command (audio-only retry):', ffmpegArgs.join(' '));
+        await ff.exec(ffmpegArgs);
+        success = true;
+        console.log('[VideoExporter] FFmpeg encoding succeeded (audio-only)');
+      } catch (thirdError) {
+        console.error('[VideoExporter] Audio-only attempt failed:', thirdError);
+        throw thirdError;
+      }
+    } else {
+      throw firstError;
+    }
+  }
+
+  if (!success) {
+    throw new Error('FFmpeg encoding failed');
   }
 
   onStatus?.('Finalizing...');
   onProgress?.(95);
 
-  // Read the output file
+  // Read output file
   const data = await ff.readFile(outputName);
   console.log('[VideoExporter] Output file size:', data.byteLength, 'bytes');
 
-  // Clean up
-  for (const { inputName } of processedClips) {
-    try {
-      await ff.deleteFile(inputName);
-    } catch (e) {
-      // Ignore cleanup errors
-    }
+  // Cleanup
+  for (const pc of processedClips) {
+    try { await ff.deleteFile(pc.inputName); } catch { /* ignore */ }
   }
-
-  try {
-    await ff.deleteFile('concat.txt');
-    await ff.deleteFile(outputName);
-  } catch (e) {
-    // Ignore cleanup errors
-  }
+  try { await ff.deleteFile(outputName); } catch { /* ignore */ }
 
   onProgress?.(100);
 
-  // Return blob
   const mimeType = format === 'webm' ? 'video/webm' : format === 'mov' ? 'video/quicktime' : 'video/mp4';
   const blob = new Blob([data], { type: mimeType });
-  console.log('[VideoExporter] Export complete, blob size:', blob.size, 'bytes');
+
+  console.log('[VideoExporter] ========== EXPORT COMPLETE ==========');
+  console.log(`[VideoExporter] Final blob: ${blob.size} bytes, type: ${mimeType}`);
+
   return blob;
 }

@@ -11,7 +11,14 @@ export default defineConfig(({ mode }) => ({
     headers: {
       // Required for SharedArrayBuffer (FFmpeg.wasm)
       'Cross-Origin-Opener-Policy': 'same-origin',
-      'Cross-Origin-Embedder-Policy': 'credentialless',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    },
+  },
+  preview: {
+    headers: {
+      // Also needed for preview mode
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
     },
   },
   plugins: [react(), mode === "development" && componentTagger()].filter(Boolean),

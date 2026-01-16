@@ -25,18 +25,29 @@ interface SharedProject {
 
 export function Projects() {
   const navigate = useNavigate();
-  const { user } = useAuth();
+  const { user, isLoading: authLoading } = useAuth();
   const [projects, setProjects] = useState<Project[]>([]);
   const [sharedProjects, setSharedProjects] = useState<SharedProject[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
+  const [isLoading, setIsLoading] = useState(false); // Start false, set true when fetching
   const [isCreating, setIsCreating] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
   const [dialogOpen, setDialogOpen] = useState(false);
   const [activeTab, setActiveTab] = useState('my-projects');
 
   useEffect(() => {
+    // Wait for auth to finish loading before fetching projects
+    if (authLoading) return;
+
+    // If not authenticated, redirect to login
+    if (!user) {
+      navigate('/login');
+      return;
+    }
+
+    // Fetch projects when auth is ready and user is logged in
+    setIsLoading(true);
     loadProjects();
-  }, []);
+  }, [authLoading, user, navigate]);
 
   const loadProjects = async () => {
     try {
@@ -90,7 +101,8 @@ export function Projects() {
     }
   };
 
-  if (isLoading) {
+  // Show loading while auth or projects are loading
+  if (authLoading || isLoading) {
     return (
       <div className="flex items-center justify-center min-h-screen">
         <p>Loading projects...</p>
